@@ -129,7 +129,9 @@ write_config() {
     "nameserver": "1.1.1.1"
 }
 EOF
-  chmod 600 /etc/shadowsocks-libev/config.json
+  # ss-server 以 nobody 运行，600 会导致 "Invalid config path"
+  chown root:root /etc/shadowsocks-libev/config.json
+  chmod 644 /etc/shadowsocks-libev/config.json
 }
 
 pre_install() {
