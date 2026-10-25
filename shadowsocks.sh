@@ -61,6 +61,7 @@ cipher_hints=(
 error() { echo -e "[${red}Error${plain}] $*" >&2; exit 1; }
 info() { echo -e "[${green}Info${plain}] $*"; }
 warn() { echo -e "[${yellow}Warn${plain}] $*"; }
+step() { echo -e "[${green}进行中${plain}] $*"; }
 
 ask() {
   local prompt="$1" var="$2"
@@ -112,7 +113,12 @@ pkg_install() {
   case "$PKG" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
+      if [[ "${APT_UPDATED:-0}" != 1 ]]; then
+        step "正在更新软件源，可能需要一两分钟..."
+        apt-get update -qq
+        APT_UPDATED=1
+      fi
+      step "正在安装: $*"
       apt-get install -y -qq "$@"
       ;;
     dnf) dnf install -y "$@" ;;
@@ -432,7 +438,7 @@ EOF
   else
     {
       echo '{'
-      echo "    \"server\": ${server_json},"
+      echo '    "server": "0.0.0.0",'
       echo '    "port_password": {'
       for i in "${!SS_PORTS[@]}"; do
         comma=","
@@ -440,10 +446,8 @@ EOF
         printf '        "%s": "%s"%s\n' "${SS_PORTS[$i]}" "${SS_PWDS[$i]}" "$comma"
       done
       echo '    },'
-      echo "    \"timeout\": 300,"
-      echo "    \"method\": \"${ss_cipher}\","
-      echo "    \"mode\": \"${ss_mode}\","
-      echo '    "fast_open": false'
+      echo '    "timeout": 300,'
+      echo "    \"method\": \"${ss_cipher}\""
       echo '}'
     } > "$CONF_FILE"
   fi
@@ -460,11 +464,9 @@ libev_args() {
 }
 
 write_systemd_unit() {
-  local exec_line
+  local extra=""
   if [[ "$SS_IMPL" == libev ]]; then
-    exec_line="${SS_BIN} $(libev_args "$ss_mode") -c ${CONF_FILE}"
-  else
-    exec_line="${SS_BIN} -c ${CONF_FILE}"
+    extra="$(libev_args "$ss_mode")"
   fi
   cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -477,9 +479,11 @@ Type=simple
 User=root
 Group=root
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 LimitNOFILE=65535
-ExecStart=${exec_line}
+StandardOutput=journal
+StandardError=journal
+ExecStart=${SS_BIN} ${extra} -c ${CONF_FILE}
 
 [Install]
 WantedBy=multi-user.target
@@ -517,15 +521,21 @@ stop_conflicts() {
   pkill -x ssserver >/dev/null 2>&1 || true
 }
 
+has_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
 start_via_systemd() {
-  command -v systemctl >/dev/null 2>&1 || return 1
-  [[ -d /run/systemd/system ]] || return 1
+  has_systemd || return 1
   write_systemd_unit
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null
-  systemctl restart "$SERVICE_NAME"
-  sleep 0.6
-  systemctl is-active --quiet "$SERVICE_NAME"
+  systemctl daemon-reload >/dev/null
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE_NAME" || true
+  sleep 1.2
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    return 0
+  fi
+  return 2
 }
 
 start_via_openrc() {
@@ -556,15 +566,22 @@ service_logs() {
 }
 
 try_start() {
+  local rc
+  step "停止旧进程，避免端口冲突"
   stop_conflicts
-  if start_via_systemd; then
-    return 0
+  if has_systemd; then
+    step "用 systemd 启动服务"
+    start_via_systemd
+    rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    warn "systemd 在运行，但服务进程退出了（配置不被当前 ss-server 接受）"
+    return 2
   fi
-  warn "systemd 不可用，尝试 OpenRC"
+  step "本机没有 systemd，尝试 OpenRC"
   if start_via_openrc; then
     return 0
   fi
-  warn "改用后台进程启动"
+  step "改用后台进程启动"
   start_via_nuhup
 }
 
@@ -754,7 +771,12 @@ pre_install() {
   echo
   ask "确认执行？y 部署 / n 取消: " confirm
   case "${confirm:-}" in
-    y|Y|yes|YES) ;;
+    y|Y|yes|YES)
+      echo
+      echo "已确认，开始部署。"
+      echo "接下来可能要装软件或下载程序，请等状态提示，不要按 Ctrl+C。"
+      echo
+      ;;
     *) echo "已取消"; exit 0 ;;
   esac
 }
@@ -769,19 +791,31 @@ write_active_config() {
 }
 
 start_with_fallback() {
-  local server_json
-  if has_ipv6; then
+  local server_json='"0.0.0.0"'
+  if [[ "$SS_PROFILE" != multi ]] && has_ipv6; then
     server_json='["0.0.0.0", "::"]'
-  else
-    server_json='"0.0.0.0"'
   fi
 
+  step "写入配置文件 ${CONF_FILE}"
   write_active_config "$server_json"
   if try_start; then
     return 0
   fi
 
-  warn "双栈或当前加密启动失败，改为仅 IPv4 + chacha20-ietf-poly1305 再试"
+  if [[ "$SS_PROFILE" == multi && "$SS_IMPL" == libev ]]; then
+    step "当前 libev 不支持这份多端口配置，改下官方 shadowsocks-rust（可能要下载 1～2 分钟）"
+    if install_rust_binary && find_rust; then
+      SS_IMPL=rust
+      SS_BIN="$BIN_RUST"
+      info "已切换到 rust: ${SS_BIN}"
+      write_active_config '"0.0.0.0"'
+      try_start && return 0
+    else
+      warn "shadowsocks-rust 下载失败"
+    fi
+  fi
+
+  step "改为仅 IPv4 + chacha20-ietf-poly1305 再试一次"
   ss_cipher="chacha20-ietf-poly1305"
   write_active_config '"0.0.0.0"'
   try_start || {
@@ -884,11 +918,14 @@ uninstall_shadowsocks() {
 install_shadowsocks() {
   detect_os
   relax_selinux
+  step "检查并安装基础工具（curl/openssl 等）"
   install_base_tools
   pre_install
+  step "选择 Shadowsocks 实现（系统包或官方二进制）"
   choose_impl
   info "使用 ${SS_IMPL}: ${SS_BIN}"
   start_with_fallback
+  step "检查本机防火墙"
   if [[ "$SS_PROFILE" == multi ]]; then
     open_firewall_range "$ss_port" "$SS_PORT_END"
   else
