@@ -34,7 +34,7 @@ USERS_FILE="/root/shadowsocks-users.txt"
 SS_PORTS=()
 SS_PWDS=()
 SS_IP_LIMIT=0
-LIMIT_BIN="/usr/local/sbin/shadowsocks-ip-limit.sh"
+LIMIT_BIN="/usr/local/sbin/shadowsocks-ip-limit.py"
 LIMIT_PORTS_FILE="${CONF_DIR}/ip-limit.ports"
 LIMIT_STATE_DIR="/var/lib/shadowsocks/ip-limit"
 LIMIT_UNIT="/etc/systemd/system/shadowsocks-ip-limit.service"
@@ -856,107 +856,230 @@ start_with_fallback() {
 write_ip_limit_script() {
   mkdir -p "$(dirname "$LIMIT_BIN")" "$LIMIT_STATE_DIR"
   cat > "$LIMIT_BIN" <<'EOF'
-#!/usr/bin/env bash
-# 每端口只保留最先连上的那个公网 IP，踢掉后来的分享者。
-PORTS_FILE="/etc/shadowsocks/ip-limit.ports"
-STATE_DIR="/var/lib/shadowsocks/ip-limit"
-CHAIN="SS_IP_LIMIT"
-INTERVAL=8
+#!/usr/bin/env python3
+"""每端口只允许 1 个公网 IP。已建立的连接也会被丢掉，不只拦新握手。"""
+from __future__ import annotations
 
-peer_ips() {
-  local port="$1" ep
-  command -v ss >/dev/null 2>&1 || return 0
-  while read -r ep; do
-    [[ -n "$ep" ]] || continue
-    if [[ "$ep" == \[* ]]; then
-      ep="${ep#\[}"
-      ep="${ep%\]:*}"
-    else
-      ep="${ep%:*}"
-    fi
-    [[ "$ep" == "127.0.0.1" || "$ep" == "::1" ]] && continue
-    printf '%s\n' "$ep"
-  done < <(ss -Htn state established "sport = :${port}" 2>/dev/null | awk '{print $NF}') | sort -u
-}
+import subprocess
+import time
+from pathlib import Path
 
-kill_peer() {
-  local port="$1" ip="$2"
-  ss -K state established "sport = :${port} dst ${ip}" >/dev/null 2>&1 || \
-    ss -K "sport = :${port} dst ${ip}" >/dev/null 2>&1 || true
-}
+PORTS_FILE = Path("/etc/shadowsocks/ip-limit.ports")
+LOG_FILE = Path("/var/log/shadowsocks-ip-limit.log")
+CHAIN = "SS_IP_LIMIT"
+IDLE_RELEASE = 45
 
-reset_fw_chain() {
-  command -v iptables >/dev/null 2>&1 || return 0
-  iptables -N "$CHAIN" 2>/dev/null || true
-  iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT -j "$CHAIN" 2>/dev/null || true
-  iptables -F "$CHAIN" 2>/dev/null || true
-}
 
-apply_fw() {
-  local port="$1" owner="$2"
-  command -v iptables >/dev/null 2>&1 || return 0
-  [[ -n "$owner" ]] || return 0
-  iptables -A "$CHAIN" -p tcp --dport "$port" -s "$owner" -j RETURN 2>/dev/null || true
-  iptables -A "$CHAIN" -p udp --dport "$port" -s "$owner" -j RETURN 2>/dev/null || true
-  iptables -A "$CHAIN" -p tcp --dport "$port" -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset 2>/dev/null || true
-  iptables -A "$CHAIN" -p udp --dport "$port" -j DROP 2>/dev/null || true
-}
+def log(msg: str) -> None:
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
-enforce_once() {
-  local port owner ip found keep
-  [[ -f "$PORTS_FILE" ]] || return 0
-  mkdir -p "$STATE_DIR"
-  reset_fw_chain
-  while read -r port; do
-    [[ "$port" =~ ^[0-9]+$ ]] || continue
-    owner=""
-    [[ -f "${STATE_DIR}/${port}" ]] && owner="$(tr -d '[:space:]' < "${STATE_DIR}/${port}")"
-    found=0
-    keep=""
-    while read -r ip; do
-      [[ -n "$ip" ]] || continue
-      if [[ -n "$owner" && "$ip" == "$owner" ]]; then
-        found=1
-        keep="$owner"
-        continue
-      fi
-      if [[ -z "$keep" && -z "$owner" ]]; then
-        keep="$ip"
-        continue
-      fi
-      if [[ -z "$keep" && "$found" -eq 0 ]]; then
-        keep="$ip"
-        continue
-      fi
-      kill_peer "$port" "$ip"
-    done < <(peer_ips "$port")
-    if [[ "$found" -eq 1 ]]; then
-      keep="$owner"
-    fi
-    if [[ -n "$keep" ]]; then
-      printf '%s\n' "$keep" > "${STATE_DIR}/${port}"
-      apply_fw "$port" "$keep"
-    else
-      rm -f "${STATE_DIR}/${port}"
-    fi
-  done < "$PORTS_FILE"
-}
 
-if [[ "${1:-}" == "once" ]]; then
-  enforce_once
-  exit 0
-fi
+def run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-while true; do
-  enforce_once
-  sleep "$INTERVAL"
-done
+
+def read_ports():
+    if not PORTS_FILE.exists():
+        return []
+    ports = []
+    for raw in PORTS_FILE.read_text(encoding="utf-8").split():
+        if raw.isdigit():
+            ports.append(int(raw))
+    return ports
+
+
+def endpoint_host(ep: str) -> str:
+    if ep.startswith("["):
+        return ep[1:].split("]", 1)[0]
+    if ep.startswith("::ffff:"):
+        ep = ep[7:]
+    if ep.count(":") == 1 and "." in ep:
+        return ep.rsplit(":", 1)[0]
+    if "." in ep:
+        return ep.rsplit(":", 1)[0]
+    return ep.rsplit(":", 1)[0]
+
+
+def peer_ips(port: int) -> set[str]:
+    result = run(["ss", "-tn"])
+    suffix = f":{port}"
+    ips: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        for idx, token in enumerate(parts[:-1]):
+            if token.endswith(suffix):
+                host = endpoint_host(parts[idx + 1])
+                if host and host not in {"127.0.0.1", "::1", "0.0.0.0", "*", "State"}:
+                    ips.add(host)
+                break
+    return ips
+
+
+def set_name(port: int, ipv6: bool = False) -> str:
+    return f"ssip{port}v6" if ipv6 else f"ssip{port}"
+
+
+def ensure_ipset(port: int) -> None:
+    for ipv6 in (False, True):
+        name = set_name(port, ipv6)
+        family = "inet6" if ipv6 else "inet"
+        listed = run(["ipset", "list", name])
+        if listed.returncode != 0:
+            created = run(["ipset", "create", name, "hash:ip", "family", family, "maxelem", "1"])
+            if created.returncode != 0:
+                log(f"ipset 创建失败 {name}: {created.stderr.strip()}")
+
+
+def ipset_members(port: int) -> list[str]:
+    members = []
+    for ipv6 in (False, True):
+        result = run(["ipset", "list", set_name(port, ipv6)])
+        grab = False
+        for line in result.stdout.splitlines():
+            if line.startswith("Members"):
+                grab = True
+                continue
+            if grab and line.strip():
+                members.append(line.strip())
+    return members
+
+
+def ipset_flush(port: int) -> None:
+    run(["ipset", "flush", set_name(port)])
+    run(["ipset", "flush", set_name(port, True)])
+
+
+def is_ipv6(ip: str) -> bool:
+    return ":" in ip and "." not in ip
+
+
+def ensure_chain(ports: list[int]) -> None:
+    run(["iptables", "-N", CHAIN])
+    if run(["iptables", "-C", "INPUT", "-j", CHAIN]).returncode != 0:
+        run(["iptables", "-I", "INPUT", "1", "-j", CHAIN])
+    run(["iptables", "-F", CHAIN])
+    for port in ports:
+        name = set_name(port)
+        port_s = str(port)
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "conntrack", "--ctstate", "NEW", "-j", "SET", "--add-set", name, "src"])
+        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-j", "SET", "--add-set", name, "src"])
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-j", "REJECT", "--reject-with", "tcp-reset"])
+        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-j", "DROP"])
+        log(f"已为端口 {port} 写入防火墙规则（最多 1 个 IPv4）")
+
+
+def drop_extra_conntrack(port: int, owner: str) -> None:
+    if not owner or not shutil_which("conntrack"):
+        return
+    for ip in peer_ips(port):
+        if ip != owner:
+            run(["conntrack", "-D", "-p", "tcp", "--dport", str(port), "-s", ip])
+            run(["conntrack", "-D", "-p", "udp", "--dport", str(port), "-s", ip])
+            log(f"端口 {port} 踢掉 {ip}")
+
+
+def shutil_which(name: str) -> bool:
+    from shutil import which
+    return which(name) is not None
+
+
+last_seen: dict[int, float] = {}
+rules_signature = ""
+
+
+def enforce_once() -> None:
+    global rules_signature
+    ports = read_ports()
+    if not ports:
+        return
+    sig = ",".join(str(p) for p in ports)
+    if sig != rules_signature:
+        for port in ports:
+            ensure_ipset(port)
+        ensure_chain(ports)
+        rules_signature = sig
+    now = time.time()
+    for port in ports:
+        members = ipset_members(port)
+        online = peer_ips(port)
+        if members:
+            owner = members[0]
+            if owner in online or online:
+                last_seen[port] = now
+            drop_extra_conntrack(port, owner)
+            if owner not in online and now - last_seen.get(port, now) >= IDLE_RELEASE:
+                ipset_flush(port)
+                last_seen.pop(port, None)
+                log(f"端口 {port} 原 IP {owner} 已离线，释放名额")
+        elif online:
+            first = sorted(online)[0]
+            name = set_name(port, is_ipv6(first))
+            added = run(["ipset", "add", name, first])
+            if added.returncode == 0:
+                last_seen[port] = now
+                log(f"端口 {port} 锁定 {first}")
+                drop_extra_conntrack(port, first)
+
+
+def main() -> None:
+    log("单 IP 限制已启动")
+    while True:
+        try:
+            enforce_once()
+        except Exception as exc:
+            log(f"循环异常: {exc}")
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
 EOF
   chmod 755 "$LIMIT_BIN"
 }
 
+python3_bin() {
+  command -v python3 || command -v python || true
+}
+
+load_ports_from_config() {
+  local py
+  py="$(python3_bin)"
+  [[ -n "$py" && -f "$CONF_FILE" ]] || return 1
+  mapfile -t SS_PORTS < <("$py" - "$CONF_FILE" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+ports = []
+if isinstance(cfg.get("port_password"), dict):
+    ports = list(cfg["port_password"])
+elif isinstance(cfg.get("servers"), list):
+    ports = [str(x.get("server_port")) for x in cfg["servers"] if x.get("server_port")]
+elif cfg.get("server_port"):
+    ports = [str(cfg["server_port"])]
+for p in ports:
+    print(p)
+PY
+)
+  [[ ${#SS_PORTS[@]} -gt 0 ]]
+}
+
 enable_ip_limit() {
-  local p
+  local p py
+  command -v iptables >/dev/null 2>&1 || error "没有 iptables，无法做单 IP 限制"
+  try_pkg ipset >/dev/null 2>&1 || pkg_install ipset || error "请先安装 ipset"
+  try_pkg python3 >/dev/null 2>&1 || true
+  try_pkg conntrack conntrack-tools >/dev/null 2>&1 || true
+  command -v ipset >/dev/null 2>&1 || error "ipset 安装失败"
+  py="$(python3_bin)"
+  [[ -n "$py" ]] || error "需要 python3"
   write_ip_limit_script
   mkdir -p "$CONF_DIR" "$LIMIT_STATE_DIR"
   : > "$LIMIT_PORTS_FILE"
@@ -972,7 +1095,7 @@ After=network.target ${SERVICE_NAME}.service
 
 [Service]
 Type=simple
-ExecStart=${LIMIT_BIN}
+ExecStart=${py} ${LIMIT_BIN}
 Restart=always
 RestartSec=3
 
@@ -982,11 +1105,31 @@ EOF
     systemctl daemon-reload >/dev/null
     systemctl enable shadowsocks-ip-limit >/dev/null 2>&1 || true
     systemctl restart shadowsocks-ip-limit
+    sleep 0.8
+    if ! systemctl is-active --quiet shadowsocks-ip-limit; then
+      journalctl -u shadowsocks-ip-limit -n 30 --no-pager 2>/dev/null || true
+      error "单 IP 限制服务启动失败，看上面日志"
+    fi
   else
-    nohup "$LIMIT_BIN" >/var/log/shadowsocks-ip-limit.log 2>&1 &
+    nohup "$py" "$LIMIT_BIN" >>/var/log/shadowsocks-ip-limit.log 2>&1 &
     echo $! >/var/run/shadowsocks-ip-limit.pid
   fi
-  info "已开启每端口单 IP 限制"
+  info "已开启每端口单 IP 限制（后连的公网 IP 会被直接丢掉）"
+}
+
+cmd_limit_on() {
+  detect_os
+  load_ports_from_config || error "读不到 ${CONF_FILE} 里的端口，请确认已经部署过多端口"
+  enable_ip_limit
+  echo "已对现有端口启用单 IP 限制，没有改密码："
+  printf '  %s\n' "${SS_PORTS[@]}"
+  echo "日志: /var/log/shadowsocks-ip-limit.log"
+}
+
+cmd_limit_off() {
+  detect_os
+  disable_ip_limit
+  echo "已关闭单 IP 限制"
 }
 
 disable_ip_limit() {
@@ -1004,7 +1147,12 @@ disable_ip_limit() {
     iptables -F SS_IP_LIMIT 2>/dev/null || true
     iptables -X SS_IP_LIMIT 2>/dev/null || true
   fi
-  rm -f "$LIMIT_UNIT" "$LIMIT_PORTS_FILE"
+  if command -v ipset >/dev/null 2>&1; then
+    ipset list -name 2>/dev/null | grep -E '^ssip[0-9]+' | while read -r n; do
+      ipset destroy "$n" 2>/dev/null || true
+    done
+  fi
+  rm -f "$LIMIT_UNIT" "$LIMIT_PORTS_FILE" "$LIMIT_BIN"
   rm -rf "$LIMIT_STATE_DIR"
 }
 
@@ -1135,8 +1283,10 @@ action="${1:-install}"
 case "$action" in
   install) install_shadowsocks ;;
   uninstall) detect_os; uninstall_shadowsocks ;;
+  limit-on) cmd_limit_on ;;
+  limit-off) cmd_limit_off ;;
   *)
-    echo "用法: $(basename "$0") [install|uninstall]"
+    echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off]"
     exit 1
     ;;
 esac
