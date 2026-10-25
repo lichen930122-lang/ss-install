@@ -33,6 +33,11 @@ SS_PORT_END=""
 USERS_FILE="/root/shadowsocks-users.txt"
 SS_PORTS=()
 SS_PWDS=()
+SS_IP_LIMIT=0
+LIMIT_BIN="/usr/local/sbin/shadowsocks-ip-limit.sh"
+LIMIT_PORTS_FILE="${CONF_DIR}/ip-limit.ports"
+LIMIT_STATE_DIR="/var/lib/shadowsocks/ip-limit"
+LIMIT_UNIT="/etc/systemd/system/shadowsocks-ip-limit.service"
 
 modes=(tcp_and_udp tcp_only udp_only)
 mode_hints=("TCP + UDP（推荐）" "仅 TCP" "仅 UDP")
@@ -755,12 +760,36 @@ pre_install() {
   echo "---------------------------"
   echo
 
+  if [[ "$SS_PROFILE" == multi ]]; then
+    echo "5) 每端口同时在线限制"
+    echo -e "  ${green}1${plain}) 同时只允许 1 个公网 IP（防止把密码发给别人一起用，推荐）"
+    echo -e "  ${green}2${plain}) 不限制（同一密码可多人同时连）"
+    ask "输入数字，回车默认 1: " pick
+    pick="${pick:-1}"
+    case "$pick" in
+      1) SS_IP_LIMIT=1 ;;
+      2) SS_IP_LIMIT=0 ;;
+      *) error "请输入 1 或 2" ;;
+    esac
+    echo "---------------------------"
+    echo "ip_limit = ${SS_IP_LIMIT}"
+    echo "---------------------------"
+    echo
+  else
+    SS_IP_LIMIT=0
+  fi
+
   ss_ip="$(get_ip)"
   echo "即将部署:"
   echo "  IP     ${ss_ip}"
   if [[ "$SS_PROFILE" == multi ]]; then
     echo "  方式   多用户 ${SS_USER_COUNT} 人"
     echo "  端口   ${ss_port}-${SS_PORT_END}（一人一端口，密码随机）"
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      echo "  限制   每端口同时只允许 1 个公网 IP"
+    else
+      echo "  限制   不限制同时在线人数"
+    fi
   else
     echo "  方式   单用户"
     echo "  端口   ${ss_port}"
@@ -824,6 +853,161 @@ start_with_fallback() {
   }
 }
 
+write_ip_limit_script() {
+  mkdir -p "$(dirname "$LIMIT_BIN")" "$LIMIT_STATE_DIR"
+  cat > "$LIMIT_BIN" <<'EOF'
+#!/usr/bin/env bash
+# 每端口只保留最先连上的那个公网 IP，踢掉后来的分享者。
+PORTS_FILE="/etc/shadowsocks/ip-limit.ports"
+STATE_DIR="/var/lib/shadowsocks/ip-limit"
+CHAIN="SS_IP_LIMIT"
+INTERVAL=8
+
+peer_ips() {
+  local port="$1" ep
+  command -v ss >/dev/null 2>&1 || return 0
+  while read -r ep; do
+    [[ -n "$ep" ]] || continue
+    if [[ "$ep" == \[* ]]; then
+      ep="${ep#\[}"
+      ep="${ep%\]:*}"
+    else
+      ep="${ep%:*}"
+    fi
+    [[ "$ep" == "127.0.0.1" || "$ep" == "::1" ]] && continue
+    printf '%s\n' "$ep"
+  done < <(ss -Htn state established "sport = :${port}" 2>/dev/null | awk '{print $NF}') | sort -u
+}
+
+kill_peer() {
+  local port="$1" ip="$2"
+  ss -K state established "sport = :${port} dst ${ip}" >/dev/null 2>&1 || \
+    ss -K "sport = :${port} dst ${ip}" >/dev/null 2>&1 || true
+}
+
+reset_fw_chain() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -N "$CHAIN" 2>/dev/null || true
+  iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT -j "$CHAIN" 2>/dev/null || true
+  iptables -F "$CHAIN" 2>/dev/null || true
+}
+
+apply_fw() {
+  local port="$1" owner="$2"
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ -n "$owner" ]] || return 0
+  iptables -A "$CHAIN" -p tcp --dport "$port" -s "$owner" -j RETURN 2>/dev/null || true
+  iptables -A "$CHAIN" -p udp --dport "$port" -s "$owner" -j RETURN 2>/dev/null || true
+  iptables -A "$CHAIN" -p tcp --dport "$port" -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset 2>/dev/null || true
+  iptables -A "$CHAIN" -p udp --dport "$port" -j DROP 2>/dev/null || true
+}
+
+enforce_once() {
+  local port owner ip found keep
+  [[ -f "$PORTS_FILE" ]] || return 0
+  mkdir -p "$STATE_DIR"
+  reset_fw_chain
+  while read -r port; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    owner=""
+    [[ -f "${STATE_DIR}/${port}" ]] && owner="$(tr -d '[:space:]' < "${STATE_DIR}/${port}")"
+    found=0
+    keep=""
+    while read -r ip; do
+      [[ -n "$ip" ]] || continue
+      if [[ -n "$owner" && "$ip" == "$owner" ]]; then
+        found=1
+        keep="$owner"
+        continue
+      fi
+      if [[ -z "$keep" && -z "$owner" ]]; then
+        keep="$ip"
+        continue
+      fi
+      if [[ -z "$keep" && "$found" -eq 0 ]]; then
+        keep="$ip"
+        continue
+      fi
+      kill_peer "$port" "$ip"
+    done < <(peer_ips "$port")
+    if [[ "$found" -eq 1 ]]; then
+      keep="$owner"
+    fi
+    if [[ -n "$keep" ]]; then
+      printf '%s\n' "$keep" > "${STATE_DIR}/${port}"
+      apply_fw "$port" "$keep"
+    else
+      rm -f "${STATE_DIR}/${port}"
+    fi
+  done < "$PORTS_FILE"
+}
+
+if [[ "${1:-}" == "once" ]]; then
+  enforce_once
+  exit 0
+fi
+
+while true; do
+  enforce_once
+  sleep "$INTERVAL"
+done
+EOF
+  chmod 755 "$LIMIT_BIN"
+}
+
+enable_ip_limit() {
+  local p
+  write_ip_limit_script
+  mkdir -p "$CONF_DIR" "$LIMIT_STATE_DIR"
+  : > "$LIMIT_PORTS_FILE"
+  for p in "${SS_PORTS[@]}"; do
+    printf '%s\n' "$p" >> "$LIMIT_PORTS_FILE"
+  done
+  chmod 600 "$LIMIT_PORTS_FILE"
+  if has_systemd; then
+    cat > "$LIMIT_UNIT" <<EOF
+[Unit]
+Description=Shadowsocks per-port single IP limiter
+After=network.target ${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+ExecStart=${LIMIT_BIN}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null
+    systemctl enable shadowsocks-ip-limit >/dev/null 2>&1 || true
+    systemctl restart shadowsocks-ip-limit
+  else
+    nohup "$LIMIT_BIN" >/var/log/shadowsocks-ip-limit.log 2>&1 &
+    echo $! >/var/run/shadowsocks-ip-limit.pid
+  fi
+  info "已开启每端口单 IP 限制"
+}
+
+disable_ip_limit() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop shadowsocks-ip-limit 2>/dev/null || true
+    systemctl disable shadowsocks-ip-limit 2>/dev/null || true
+  fi
+  if [[ -f /var/run/shadowsocks-ip-limit.pid ]]; then
+    kill "$(cat /var/run/shadowsocks-ip-limit.pid)" 2>/dev/null || true
+    rm -f /var/run/shadowsocks-ip-limit.pid
+  fi
+  pkill -f "$LIMIT_BIN" >/dev/null 2>&1 || true
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -D INPUT -j SS_IP_LIMIT 2>/dev/null || true
+    iptables -F SS_IP_LIMIT 2>/dev/null || true
+    iptables -X SS_IP_LIMIT 2>/dev/null || true
+  fi
+  rm -f "$LIMIT_UNIT" "$LIMIT_PORTS_FILE"
+  rm -rf "$LIMIT_STATE_DIR"
+}
+
 save_users_file() {
   local i uri
   {
@@ -869,6 +1053,10 @@ print_result() {
     done
     save_users_file
     echo "账号表已保存: ${USERS_FILE}（仅 root 可读）"
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      echo "已限制：每个端口同时只允许 1 个公网 IP。后连上的会被踢掉。"
+      echo "同一 Wi-Fi/公司 NAT 下多台设备仍算同一个 IP，可以一起用。"
+    fi
     echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}"
   else
     uri="$(make_ss_uri "$ss_cipher" "$ss_pwd" "$ss_ip" "$ss_port")"
@@ -896,6 +1084,7 @@ uninstall_shadowsocks() {
     echo "已取消"
     return
   fi
+  disable_ip_limit
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
@@ -928,8 +1117,15 @@ install_shadowsocks() {
   step "检查本机防火墙"
   if [[ "$SS_PROFILE" == multi ]]; then
     open_firewall_range "$ss_port" "$SS_PORT_END"
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      step "开启每端口单 IP 限制"
+      enable_ip_limit
+    else
+      disable_ip_limit
+    fi
   else
     open_firewall "$ss_port"
+    disable_ip_limit
   fi
   print_result
 }
