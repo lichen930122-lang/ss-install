@@ -1050,24 +1050,56 @@ python3_bin() {
   command -v python3 || command -v python || true
 }
 
+find_ss_config() {
+  local f
+  for f in "$CONF_FILE" /etc/shadowsocks-libev/config.json /etc/shadowsocks.json; do
+    [[ -s "$f" ]] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+parse_ports_from_text() {
+  local file="$1"
+  grep -oE '"[0-9]{2,5}":' "$file" 2>/dev/null | tr -d '":'
+  grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$file" 2>/dev/null | grep -oE '[0-9]+$'
+}
+
 load_ports_from_config() {
-  local py
+  local py file
+  SS_PORTS=()
+  file="$(find_ss_config || true)"
+  if [[ -z "$file" ]]; then
+    warn "找不到配置文件（试过 ${CONF_FILE} 和 /etc/shadowsocks-libev/config.json）"
+    return 1
+  fi
+  CONF_FILE="$file"
   py="$(python3_bin)"
-  [[ -n "$py" && -f "$CONF_FILE" ]] || return 1
-  mapfile -t SS_PORTS < <("$py" - "$CONF_FILE" <<'PY'
+  if [[ -n "$py" ]]; then
+    mapfile -t SS_PORTS < <("$py" - "$file" <<'PY' 2>/dev/null
 import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
 ports = []
 if isinstance(cfg.get("port_password"), dict):
     ports = list(cfg["port_password"])
 elif isinstance(cfg.get("servers"), list):
-    ports = [str(x.get("server_port")) for x in cfg["servers"] if x.get("server_port")]
+    ports = [str(x.get("server_port")) for x in cfg["servers"] if isinstance(x, dict) and x.get("server_port")]
 elif cfg.get("server_port"):
     ports = [str(cfg["server_port"])]
 for p in ports:
-    print(p)
+    if str(p).isdigit():
+        print(p)
 PY
 )
+  fi
+  if [[ ${#SS_PORTS[@]} -eq 0 ]]; then
+    mapfile -t SS_PORTS < <(parse_ports_from_text "$file" | awk 'NF && !seen[$0]++')
+  fi
+  if [[ ${#SS_PORTS[@]} -eq 0 && -f "$USERS_FILE" ]]; then
+    mapfile -t SS_PORTS < <(awk '/^  端口/{print $2}' "$USERS_FILE" | grep -E '^[0-9]+$')
+  fi
   [[ ${#SS_PORTS[@]} -gt 0 ]]
 }
 
@@ -1119,10 +1151,18 @@ EOF
 
 cmd_limit_on() {
   detect_os
-  load_ports_from_config || error "读不到 ${CONF_FILE} 里的端口，请确认已经部署过多端口"
+  try_pkg python3 >/dev/null 2>&1 || true
+  if ! load_ports_from_config; then
+    echo "当前能看到的配置："
+    ls -l "$CONF_FILE" /etc/shadowsocks-libev/config.json /etc/shadowsocks.json "$USERS_FILE" 2>/dev/null || true
+    echo "----- config.json 前 40 行 -----"
+    head -n 40 "$CONF_FILE" 2>/dev/null || echo "(没有 ${CONF_FILE})"
+    error "读不到端口。若还没部署成功，先运行: ./shadowsocks.sh （选多端口）。若已经在用，把上面打印的配置发回来。"
+  fi
   enable_ip_limit
   echo "已对现有端口启用单 IP 限制，没有改密码："
   printf '  %s\n' "${SS_PORTS[@]}"
+  echo "配置: ${CONF_FILE}"
   echo "日志: /var/log/shadowsocks-ip-limit.log"
 }
 
