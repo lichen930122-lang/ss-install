@@ -1105,11 +1105,12 @@ PY
 
 enable_ip_limit() {
   local p py
-  command -v iptables >/dev/null 2>&1 || error "没有 iptables，无法做单 IP 限制"
-  try_pkg ipset >/dev/null 2>&1 || pkg_install ipset || error "请先安装 ipset"
-  try_pkg python3 >/dev/null 2>&1 || true
-  try_pkg conntrack conntrack-tools >/dev/null 2>&1 || true
-  command -v ipset >/dev/null 2>&1 || error "ipset 安装失败"
+  command -v iptables >/dev/null 2>&1 || pkg_install iptables || true
+  command -v ipset >/dev/null 2>&1 || pkg_install ipset || true
+  command -v python3 >/dev/null 2>&1 || pkg_install python3 || true
+  command -v conntrack >/dev/null 2>&1 || pkg_install conntrack || pkg_install conntrack-tools || true
+  command -v iptables >/dev/null 2>&1 || error "没有 iptables。请先执行: apt-get install -y iptables ipset python3"
+  command -v ipset >/dev/null 2>&1 || error "ipset 安装失败。请先执行: apt-get install -y ipset"
   py="$(python3_bin)"
   [[ -n "$py" ]] || error "需要 python3"
   write_ip_limit_script
