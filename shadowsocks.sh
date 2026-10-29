@@ -40,6 +40,10 @@ LIMIT_PORTS_FILE="${CONF_DIR}/ip-limit.ports"
 LIMIT_STATE_DIR="/var/lib/shadowsocks/ip-limit"
 LIMIT_UNIT="/etc/systemd/system/shadowsocks-ip-limit.service"
 REGISTER_PORT_FILE="${CONF_DIR}/register.port"
+REGISTER_CERT="${CONF_DIR}/register.crt"
+REGISTER_KEY="${CONF_DIR}/register.key"
+REGISTER_SPKI_FILE="${CONF_DIR}/register.spki"
+REGISTER_SPKI=""
 TOKEN_PORT="${TOKEN_PORT:-443}"
 
 modes=(tcp_and_udp tcp_only udp_only)
@@ -833,7 +837,7 @@ pre_install() {
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
       TOKEN_PORT=443
       echo "---------------------------"
-      echo "登记口 = TCP ${TOKEN_PORT}（令牌客户端写死这个口，不进 ss://）"
+      echo "登记口 = HTTPS ${TOKEN_PORT}（令牌客户端写死这个口，自签+钉指纹，不进 ss://）"
       echo "---------------------------"
       echo
     fi
@@ -848,7 +852,7 @@ pre_install() {
     echo "  方式   多用户 ${SS_USER_COUNT} 人"
     echo "  端口   ${ss_port}-${SS_PORT_END}（一人一端口，密码随机）"
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
-      echo "  登记口 TCP ${TOKEN_PORT}（令牌客户端写死，不进 ss://）"
+      echo "  登记口 HTTPS ${TOKEN_PORT}（自签证书，指纹见账号表）"
       echo "  限制   每端口同时只允许 1 个公网 IP"
     else
       echo "  限制   不限制同时在线人数"
@@ -931,6 +935,7 @@ import re
 import subprocess
 import threading
 import time
+import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -943,6 +948,8 @@ HMAC_WINDOW = 180
 TOKEN_GRACE = 90
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 REGISTER_PORT_FILE = Path("/etc/shadowsocks/register.port")
+REGISTER_CERT = Path("/etc/shadowsocks/register.crt")
+REGISTER_KEY = Path("/etc/shadowsocks/register.key")
 
 
 def read_register_port() -> int:
@@ -1317,8 +1324,15 @@ def enforce_once() -> None:
 
 
 def serve_tokens() -> None:
+    if not REGISTER_CERT.exists() or not REGISTER_KEY.exists():
+        log("缺少 /etc/shadowsocks/register.crt 或 register.key，HTTPS 登记口未启动")
+        return
     httpd = ThreadingHTTPServer(("0.0.0.0", TOKEN_PORT), Handler)
-    log(f"令牌登记端口 {TOKEN_PORT}")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(str(REGISTER_CERT), str(REGISTER_KEY))
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    log(f"令牌登记端口 {TOKEN_PORT} HTTPS")
     httpd.serve_forever()
 
 
@@ -1396,6 +1410,28 @@ PY
   [[ ${#SS_PORTS[@]} -gt 0 ]]
 }
 
+ensure_register_cert() {
+  local crt="$REGISTER_CERT" key="$REGISTER_KEY" spki="$REGISTER_SPKI_FILE"
+  command -v openssl >/dev/null 2>&1 || pkg_install openssl || true
+  command -v openssl >/dev/null 2>&1 || error "需要 openssl 才能生成登记口证书"
+  mkdir -p "$CONF_DIR"
+  if [[ ! -s "$crt" || ! -s "$key" ]]; then
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+      -keyout "$key" -out "$crt" -subj "/CN=ss-register" >/dev/null 2>&1 \
+      || error "生成登记口自签证书失败"
+  fi
+  chmod 600 "$key"
+  chmod 644 "$crt"
+  openssl x509 -in "$crt" -pubkey -noout \
+    | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary \
+    | openssl base64 -A > "$spki" \
+    || error "计算登记口证书指纹失败"
+  chmod 644 "$spki"
+  REGISTER_SPKI="$(tr -d ' \r\n' < "$spki")"
+  [[ -n "$REGISTER_SPKI" ]] || error "登记口指纹为空"
+}
+
 resolve_register_port() {
   if [[ -n "${SS_TOKEN_PORT:-}" ]]; then
     TOKEN_PORT="$SS_TOKEN_PORT"
@@ -1424,6 +1460,7 @@ enable_ip_limit() {
   if port_in_use "$TOKEN_PORT"; then
     error "登记口 TCP ${TOKEN_PORT} 已被占用。独享用 443，请先停掉占用该口的程序（nginx/caddy 等）"
   fi
+  ensure_register_cert
   write_ip_limit_script
   mkdir -p "$CONF_DIR"
   printf '%s\n' "$TOKEN_PORT" > "$REGISTER_PORT_FILE"
@@ -1463,7 +1500,7 @@ EOF
     nohup "$py" "$LIMIT_BIN" >>/var/log/shadowsocks-ip-limit.log 2>&1 &
     echo $! >/var/run/shadowsocks-ip-limit.pid
   fi
-  info "已开启独享：普通 SS 可先连先占；带令牌客户端换网络可顶替。请放行 TCP ${TOKEN_PORT}"
+  info "已开启独享：普通 SS 可先连先占；带令牌客户端换网络可顶替。请放行 TCP ${TOKEN_PORT}（HTTPS）"
 }
 
 cmd_limit_on() {
@@ -1480,8 +1517,10 @@ cmd_limit_on() {
   echo "已对现有端口启用独享（普通 SS 与令牌客户端都可用），没有改密码："
   printf '  %s\n' "${SS_PORTS[@]}"
   echo "配置: ${CONF_FILE}"
-  echo "令牌登记端口: TCP ${TOKEN_PORT}（客户端写死 443，不进 ss://）"
+  echo "令牌登记端口: HTTPS ${TOKEN_PORT}（客户端写死 443，不进 ss://，不再提供明文 HTTP）"
+  echo "登记指纹 SPKI SHA-256: ${REGISTER_SPKI}"
   echo "云安全组：业务口 TCP/UDP ${SS_PORTS[0]:-?}–段，另放行 TCP ${TOKEN_PORT}"
+  echo "自检: curl -sk https://127.0.0.1:${TOKEN_PORT}/health"
   echo "日志: /var/log/shadowsocks-ip-limit.log"
 }
 
@@ -1523,7 +1562,8 @@ save_users_file() {
     echo "加密      ${ss_cipher}"
     echo "模式      ${ss_mode}"
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
-      echo "登记口    ${TOKEN_PORT}（令牌客户端写死，POST /register，不进 ss://）"
+      echo "登记口    HTTPS ${TOKEN_PORT}（令牌客户端 POST /register，不进 ss://）"
+      echo "登记指纹  ${REGISTER_SPKI}"
     fi
     echo
     for i in "${!SS_PORTS[@]}"; do
@@ -1567,7 +1607,8 @@ print_result() {
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
       echo "已限制：每个端口同时只允许 1 个公网 IP。后连上的会被踢掉。"
       echo "同一 Wi-Fi/公司 NAT 下多台设备仍算同一个 IP，可以一起用。"
-      echo -e " 登记口    \033[41;37m TCP ${TOKEN_PORT} \033[0m  （令牌客户端写死，不进 ss://）"
+      echo -e " 登记口    \033[41;37m HTTPS ${TOKEN_PORT} \033[0m  （令牌客户端写死，不进 ss://）"
+      echo -e " 登记指纹  \033[41;37m ${REGISTER_SPKI} \033[0m  （写进令牌客户端，不进 ss://）"
       echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}，以及 TCP ${TOKEN_PORT}"
     else
       echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}"

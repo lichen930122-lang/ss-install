@@ -51,7 +51,7 @@ chmod +x shadowsocks.sh
 确认执行 → y
 ```
 
-装完用 `/root/shadowsocks-users.txt` 里的 `ss://` 链接给客户端。独享时令牌客户端登记口固定 **TCP 443**（不进 `ss://`）。云安全组放行业务口 **TCP+UDP**，以及 **TCP 443**。
+装完用 `/root/shadowsocks-users.txt` 里的 `ss://` 链接给客户端。独享时令牌客户端登记口是 **HTTPS 443**（自签证书，指纹在账号表「登记指纹」，不进 `ss://`）。普通 Shadowrocket 只连业务口，不用指纹。云安全组放行业务口 **TCP+UDP**，以及 **TCP 443**。
 
 ---
 
