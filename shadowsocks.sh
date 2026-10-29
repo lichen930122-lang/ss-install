@@ -431,7 +431,48 @@ make_ss_uri() {
   local method="$1" password="$2" host="$3" port="$4"
   local userinfo
   userinfo="$(printf '%s' "${method}:${password}" | b64_nopad)"
-  printf 'ss://%s@%s:%s\n' "$userinfo" "$host" "$port"
+  printf 'ss://%s@%s:%s' "$userinfo" "$host" "$port"
+}
+
+urlencode_rfc3986() {
+  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+make_airlink_uri() {
+  local method="$1" password="$2" host="$3" port="$4" base enc
+  [[ -n "$REGISTER_SPKI" ]] || return 1
+  base="$(make_ss_uri "$method" "$password" "$host" "$port")"
+  enc="$(urlencode_rfc3986 "$REGISTER_SPKI")"
+  printf '%s?spki=%s' "$base" "$enc"
+}
+
+rewrite_users_airlink_links() {
+  local py
+  [[ -n "$REGISTER_SPKI" && -f "$USERS_FILE" ]] || return 0
+  py="$(python3_bin)"
+  [[ -n "$py" ]] || py=python3
+  "$py" - "$USERS_FILE" "$REGISTER_SPKI" <<'PY'
+import pathlib
+import re
+import sys
+import urllib.parse
+
+path = pathlib.Path(sys.argv[1])
+spki = sys.argv[2]
+enc = urllib.parse.quote(spki, safe="")
+lines = path.read_text(encoding="utf-8").splitlines()
+out = []
+for line in lines:
+    if re.match(r"^\s+Airlink\s+", line):
+        continue
+    out.append(line)
+    m = re.match(r"^(\s+链接\s+)(ss://[^\s?#]+)", line)
+    if m:
+        out.append(f"  Airlink  {m.group(2)}?spki={enc}")
+text = "\n".join(out) + "\n"
+path.write_text(text, encoding="utf-8")
+PY
+  chmod 600 "$USERS_FILE"
 }
 
 publish_config() {
@@ -1522,6 +1563,10 @@ cmd_limit_on() {
   echo "云安全组：业务口 TCP/UDP ${SS_PORTS[0]:-?}–段，另放行 TCP ${TOKEN_PORT}"
   echo "自检: curl -sk https://127.0.0.1:${TOKEN_PORT}/health"
   echo "日志: /var/log/shadowsocks-ip-limit.log"
+  rewrite_users_airlink_links
+  if [[ -f "$USERS_FILE" ]]; then
+    echo "已在 ${USERS_FILE} 为每个用户补上 Airlink 链接（?spki=）。普通「链接」未改。"
+  fi
 }
 
 cmd_limit_off() {
@@ -1572,6 +1617,9 @@ save_users_file() {
       echo "  端口    ${SS_PORTS[$i]}"
       echo "  密码    ${SS_PWDS[$i]}"
       echo "  链接    ${uri}"
+      if [[ "$SS_IP_LIMIT" -eq 1 && -n "$REGISTER_SPKI" ]]; then
+        echo "  Airlink  $(make_airlink_uri "$ss_cipher" "${SS_PWDS[$i]}" "$ss_ip" "${SS_PORTS[$i]}")"
+      fi
       echo
     done
   } > "$USERS_FILE"
@@ -1597,6 +1645,9 @@ print_result() {
       echo -e " 端口      \033[41;37m ${SS_PORTS[$i]} \033[0m"
       echo -e " 密码      \033[41;37m ${SS_PWDS[$i]} \033[0m"
       echo -e " 链接      ${green}${uri}${plain}"
+      if [[ "$SS_IP_LIMIT" -eq 1 && -n "$REGISTER_SPKI" ]]; then
+        echo -e " Airlink   ${green}$(make_airlink_uri "$ss_cipher" "${SS_PWDS[$i]}" "$ss_ip" "${SS_PORTS[$i]}")${plain}"
+      fi
       if command -v qrencode >/dev/null 2>&1 && (( SS_USER_COUNT <= 8 )); then
         qrencode -t ANSIUTF8 -m 1 "$uri" 2>/dev/null || qrencode -t ANSI -m 1 "$uri" 2>/dev/null || true
       fi
@@ -1608,7 +1659,8 @@ print_result() {
       echo "已限制：每个端口同时只允许 1 个公网 IP。后连上的会被踢掉。"
       echo "同一 Wi-Fi/公司 NAT 下多台设备仍算同一个 IP，可以一起用。"
       echo -e " 登记口    \033[41;37m HTTPS ${TOKEN_PORT} \033[0m  （令牌客户端写死，不进 ss://）"
-      echo -e " 登记指纹  \033[41;37m ${REGISTER_SPKI} \033[0m  （写进令牌客户端，不进 ss://）"
+      echo -e " 登记指纹  \033[41;37m ${REGISTER_SPKI} \033[0m"
+      echo "普通客户端用「链接」；Airlink 用带 ?spki= 的那一行（导入即带指纹）"
       echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}，以及 TCP ${TOKEN_PORT}"
     else
       echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}"

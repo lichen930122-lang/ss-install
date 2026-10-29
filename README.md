@@ -51,7 +51,7 @@ chmod +x shadowsocks.sh
 确认执行 → y
 ```
 
-装完用 `/root/shadowsocks-users.txt` 里的 `ss://` 链接给客户端。独享时令牌客户端登记口是 **HTTPS 443**（自签证书，指纹在账号表「登记指纹」，不进 `ss://`）。普通 Shadowrocket 只连业务口，不用指纹。云安全组放行业务口 **TCP+UDP**，以及 **TCP 443**。
+装完看 `/root/shadowsocks-users.txt`：`链接` 给 Shadowrocket；独享时还有 `Airlink` 一行（`ss://...?spki=...`），导入 Airlink 会自动带上登记指纹。普通客户端不要用 Airlink 那行。云安全组放行业务口 **TCP+UDP**，以及 **TCP 443**。
 
 ---
 
