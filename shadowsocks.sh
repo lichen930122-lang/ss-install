@@ -39,6 +39,7 @@ LIMIT_BIN="/usr/local/sbin/shadowsocks-ip-limit.py"
 LIMIT_PORTS_FILE="${CONF_DIR}/ip-limit.ports"
 LIMIT_STATE_DIR="/var/lib/shadowsocks/ip-limit"
 LIMIT_UNIT="/etc/systemd/system/shadowsocks-ip-limit.service"
+TOKEN_PORT="${TOKEN_PORT:-23780}"
 
 modes=(tcp_and_udp tcp_only udp_only)
 mode_hints=("TCP + UDP（推荐）" "仅 TCP" "仅 UDP")
@@ -910,17 +911,31 @@ write_ip_limit_script() {
   mkdir -p "$(dirname "$LIMIT_BIN")" "$LIMIT_STATE_DIR"
   cat > "$LIMIT_BIN" <<'EOF'
 #!/usr/bin/env python3
-"""每端口只允许 1 个公网 IP。已建立的连接也会被丢掉，不只拦新握手。"""
+"""独享：客户端令牌认设备，ipset 只放行该令牌当前公网 IP。"""
 from __future__ import annotations
 
+import hmac
+import json
+import os
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORTS_FILE = Path("/etc/shadowsocks/ip-limit.ports")
 LOG_FILE = Path("/var/log/shadowsocks-ip-limit.log")
+TOKEN_FILE = Path("/var/lib/shadowsocks/ip-limit/tokens.json")
 CHAIN = "SS_IP_LIMIT"
 IDLE_RELEASE = 45
+HMAC_WINDOW = 180
+TOKEN_PORT = int(os.environ.get("SS_TOKEN_PORT", "23780"))
+CONF_FILES = (
+    "/etc/shadowsocks/config.json",
+    "/etc/shadowsocks-libev/config.json",
+    "/etc/shadowsocks.json",
+)
+token_lock = threading.Lock()
 
 
 def log(msg: str) -> None:
@@ -944,6 +959,50 @@ def read_ports():
         if raw.isdigit():
             ports.append(int(raw))
     return ports
+
+
+def load_passwords() -> dict[int, str]:
+    out: dict[int, str] = {}
+    for path in CONF_FILES:
+        p = Path(path)
+        if not p.exists():
+            continue
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(cfg.get("port_password"), dict):
+            for port, pwd in cfg["port_password"].items():
+                if str(port).isdigit() and pwd:
+                    out[int(port)] = str(pwd)
+        for item in cfg.get("servers") or []:
+            if not isinstance(item, dict):
+                continue
+            port = item.get("server_port")
+            pwd = item.get("password")
+            if port and pwd:
+                out[int(port)] = str(pwd)
+        if cfg.get("server_port") and cfg.get("password"):
+            out[int(cfg["server_port"])] = str(cfg["password"])
+        if out:
+            break
+    return out
+
+
+def load_tokens() -> dict:
+    if not TOKEN_FILE.exists():
+        return {}
+    try:
+        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_tokens(data: dict) -> None:
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    TOKEN_FILE.chmod(0o600)
 
 
 def endpoint_host(ep: str) -> str:
@@ -1011,6 +1070,15 @@ def is_ipv6(ip: str) -> bool:
     return ":" in ip and "." not in ip
 
 
+def bind_ip(port: int, ip: str) -> None:
+    ensure_ipset(port)
+    ipset_flush(port)
+    name = set_name(port, is_ipv6(ip))
+    run(["ipset", "add", name, ip])
+    last_seen[port] = time.time()
+    drop_extra_conntrack(port, ip)
+
+
 def ensure_chain(ports: list[int]) -> None:
     run(["iptables", "-N", CHAIN])
     if run(["iptables", "-C", "INPUT", "-j", CHAIN]).returncode != 0:
@@ -1021,13 +1089,9 @@ def ensure_chain(ports: list[int]) -> None:
         port_s = str(port)
         run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
         run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
-        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "conntrack", "--ctstate", "NEW", "-j", "SET", "--add-set", name, "src"])
-        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-j", "SET", "--add-set", name, "src"])
-        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
-        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
         run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-j", "REJECT", "--reject-with", "tcp-reset"])
         run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-j", "DROP"])
-        log(f"已为端口 {port} 写入防火墙规则（最多 1 个 IPv4）")
+        log(f"已为端口 {port} 写入防火墙规则（仅放行已登记令牌的 IP）")
 
 
 def drop_extra_conntrack(port: int, owner: str) -> None:
@@ -1049,6 +1113,90 @@ last_seen: dict[int, float] = {}
 rules_signature = ""
 
 
+def sign(password: str, port: int, token: str, ts: int) -> str:
+    msg = f"{port}|{token}|{ts}".encode()
+    import hashlib
+    return hmac.new(password.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def register_token(port: int, token: str, src_ip: str) -> tuple[int, str]:
+    if not token or len(token) < 16:
+        return 400, "令牌无效"
+    with token_lock:
+        data = load_tokens()
+        key = str(port)
+        cur = data.get(key) if isinstance(data.get(key), dict) else None
+        if cur and cur.get("token") and cur["token"] != token:
+            return 409, "该端口已绑定其他设备"
+        data[key] = {"token": token, "ip": src_ip, "ts": int(time.time())}
+        save_tokens(data)
+        bind_ip(port, src_ip)
+        log(f"端口 {port} 令牌登记 {src_ip}")
+        return 200, src_ip
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+    def _json(self, code: int, obj: dict) -> None:
+        raw = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/health"):
+            self._json(200, {"ok": True})
+            return
+        self._json(404, {"ok": False})
+
+    def do_POST(self) -> None:
+        if not self.path.startswith("/register"):
+            self._json(404, {"ok": False})
+            return
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0 or length > 4096:
+            self._json(400, {"ok": False, "error": "请求过大"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            self._json(400, {"ok": False, "error": "JSON 无效"})
+            return
+        try:
+            port = int(body.get("port"))
+            token = str(body.get("token") or "")
+            ts = int(body.get("ts"))
+            digest = str(body.get("hmac") or "")
+        except (TypeError, ValueError):
+            self._json(400, {"ok": False, "error": "字段无效"})
+            return
+        if abs(int(time.time()) - ts) > HMAC_WINDOW:
+            self._json(400, {"ok": False, "error": "时间戳过期"})
+            return
+        if port not in read_ports():
+            self._json(404, {"ok": False, "error": "端口未开启独享"})
+            return
+        passwords = load_passwords()
+        password = passwords.get(port)
+        if not password:
+            self._json(500, {"ok": False, "error": "读不到密码"})
+            return
+        expect = sign(password, port, token, ts)
+        if not hmac.compare_digest(expect, digest):
+            self._json(403, {"ok": False, "error": "校验失败"})
+            return
+        src = (self.client_address[0] or "").replace("::ffff:", "")
+        code, detail = register_token(port, token, src)
+        if code == 200:
+            self._json(200, {"ok": True, "ip": detail})
+        else:
+            self._json(code, {"ok": False, "error": detail})
+
+
 def enforce_once() -> None:
     global rules_signature
     ports = read_ports()
@@ -1061,30 +1209,42 @@ def enforce_once() -> None:
         ensure_chain(ports)
         rules_signature = sig
     now = time.time()
+    with token_lock:
+        data = load_tokens()
     for port in ports:
+        rec = data.get(str(port)) if isinstance(data.get(str(port)), dict) else None
+        owner = (rec or {}).get("ip") or ""
         members = ipset_members(port)
         online = peer_ips(port)
-        if members:
-            owner = members[0]
-            if owner in online or online:
+        if owner:
+            if members != [owner]:
+                bind_ip(port, owner)
+            if owner in online:
                 last_seen[port] = now
             drop_extra_conntrack(port, owner)
             if owner not in online and now - last_seen.get(port, now) >= IDLE_RELEASE:
                 ipset_flush(port)
                 last_seen.pop(port, None)
-                log(f"端口 {port} 原 IP {owner} 已离线，释放名额")
-        elif online:
-            first = sorted(online)[0]
-            name = set_name(port, is_ipv6(first))
-            added = run(["ipset", "add", name, first])
-            if added.returncode == 0:
-                last_seen[port] = now
-                log(f"端口 {port} 锁定 {first}")
-                drop_extra_conntrack(port, first)
+                with token_lock:
+                    data2 = load_tokens()
+                    if str(port) in data2 and isinstance(data2[str(port)], dict):
+                        data2[str(port)]["ip"] = ""
+                        save_tokens(data2)
+                log(f"端口 {port} 原 IP {owner} 已离线，保留令牌")
+        else:
+            if members:
+                ipset_flush(port)
+
+
+def serve_tokens() -> None:
+    httpd = ThreadingHTTPServer(("0.0.0.0", TOKEN_PORT), Handler)
+    log(f"令牌登记端口 {TOKEN_PORT}")
+    httpd.serve_forever()
 
 
 def main() -> None:
-    log("单 IP 限制已启动")
+    log("单 IP 限制已启动（令牌认设备）")
+    threading.Thread(target=serve_tokens, daemon=True).start()
     while True:
         try:
             enforce_once()
@@ -1167,6 +1327,7 @@ enable_ip_limit() {
   py="$(python3_bin)"
   [[ -n "$py" ]] || error "需要 python3"
   write_ip_limit_script
+  open_firewall "$TOKEN_PORT"
   mkdir -p "$CONF_DIR" "$LIMIT_STATE_DIR"
   : > "$LIMIT_PORTS_FILE"
   for p in "${SS_PORTS[@]}"; do
@@ -1200,7 +1361,7 @@ EOF
     nohup "$py" "$LIMIT_BIN" >>/var/log/shadowsocks-ip-limit.log 2>&1 &
     echo $! >/var/run/shadowsocks-ip-limit.pid
   fi
-  info "已开启每端口单 IP 限制（后连的公网 IP 会被直接丢掉）"
+  info "已开启独享（客户端令牌认设备）。请放行 TCP ${TOKEN_PORT}（令牌登记）"
 }
 
 cmd_limit_on() {
@@ -1214,9 +1375,10 @@ cmd_limit_on() {
     error "读不到端口。若还没部署成功，先运行: ./shadowsocks.sh （选多端口）。若已经在用，把上面打印的配置发回来。"
   fi
   enable_ip_limit
-  echo "已对现有端口启用单 IP 限制，没有改密码："
+  echo "已对现有端口启用独享（令牌认设备），没有改密码："
   printf '  %s\n' "${SS_PORTS[@]}"
   echo "配置: ${CONF_FILE}"
+  echo "令牌登记端口: ${TOKEN_PORT}/tcp（云安全组需要放行）"
   echo "日志: /var/log/shadowsocks-ip-limit.log"
 }
 
