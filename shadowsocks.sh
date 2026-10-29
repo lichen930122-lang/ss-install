@@ -25,6 +25,7 @@ OPENRC_FILE="/etc/init.d/${SERVICE_NAME}"
 BIN_LIBEV=""
 BIN_RUST="/usr/local/bin/ssserver"
 SS_IMPL=""
+SS_IMPL_MODE="auto"
 SS_BIN=""
 SS_RUST_VERSION="${SS_RUST_VERSION:-1.25.0}"
 SS_PROFILE="single"
@@ -267,7 +268,7 @@ install_rust_binary() {
   find_rust
 }
 
-choose_impl() {
+choose_impl_auto() {
   if find_libev; then
     SS_IMPL=libev
     SS_BIN="$BIN_LIBEV"
@@ -291,6 +292,44 @@ choose_impl() {
     return 0
   fi
   error "无法安装 Shadowsocks（系统包和官方二进制都失败）。请检查网络能否访问 GitHub。"
+}
+
+choose_impl_rust() {
+  if find_rust; then
+    SS_IMPL=rust
+    SS_BIN="$BIN_RUST"
+    return 0
+  fi
+  info "下载官方 shadowsocks-rust..."
+  if install_rust_binary && find_rust; then
+    SS_IMPL=rust
+    SS_BIN="$BIN_RUST"
+    return 0
+  fi
+  error "shadowsocks-rust 安装失败。请检查网络能否访问 GitHub。"
+}
+
+choose_impl_libev() {
+  if find_libev; then
+    SS_IMPL=libev
+    SS_BIN="$BIN_LIBEV"
+    return 0
+  fi
+  info "尝试从系统软件源安装 shadowsocks-libev..."
+  if install_libev_pkg && find_libev; then
+    SS_IMPL=libev
+    SS_BIN="$BIN_LIBEV"
+    return 0
+  fi
+  error "系统源没有可用的 shadowsocks-libev。可改选 rust 或「根据系统自动选择」。"
+}
+
+choose_impl() {
+  case "$SS_IMPL_MODE" in
+    rust) choose_impl_rust ;;
+    libev) choose_impl_libev ;;
+    *) choose_impl_auto ;;
+  esac
 }
 
 random_password() {
@@ -652,10 +691,24 @@ pre_install() {
   echo "系统: ${OS_ID:-unknown}  包管理: ${PKG:-none}"
   echo
 
+  echo "0) 服务端程序"
+  echo -e "  ${green}1${plain}) 根据系统自动选择    推荐。兼容的版本，无需区分 Rust 或 libev，单端口用系统里的，多端口自动换成 rust"
+  echo -e "  ${green}2${plain}) shadowsocks-rust     官方在维护，单/多端口都推荐，和常见客户端兼容"
+  echo -e "  ${green}3${plain}) shadowsocks-libev    上游已停更，单端口够用；多端口经常装不上"
+  local i pick start n
+  ask "输入数字，回车默认 1: " pick
+  pick="${pick:-1}"
+  case "$pick" in
+    1) SS_IMPL_MODE=auto ;;
+    2) SS_IMPL_MODE=rust ;;
+    3) SS_IMPL_MODE=libev ;;
+    *) error "请输入 1、2 或 3" ;;
+  esac
+  echo
+
   echo "0) 部署方式"
   echo -e "  ${green}1${plain}) 单端口单用户（原版）"
   echo -e "  ${green}2${plain}) 多端口多人（一个端口一把密码）"
-  local i pick start n
   ask "输入数字，回车默认 1: " pick
   pick="${pick:-1}"
   case "$pick" in
@@ -831,7 +884,7 @@ start_with_fallback() {
     return 0
   fi
 
-  if [[ "$SS_PROFILE" == multi && "$SS_IMPL" == libev ]]; then
+  if [[ "$SS_IMPL_MODE" == auto && "$SS_PROFILE" == multi && "$SS_IMPL" == libev ]]; then
     step "当前 libev 不支持这份多端口配置，改下官方 shadowsocks-rust（可能要下载 1～2 分钟）"
     if install_rust_binary && find_rust; then
       SS_IMPL=rust
