@@ -1184,7 +1184,12 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _json(self, code: int, obj: dict) -> None:
-        raw = json.dumps(obj, ensure_ascii=False).encode()
+        payload = {"ss_limit": True, "ok": bool(obj.get("ok"))}
+        payload.update(obj)
+        payload["ss_limit"] = True
+        if payload["ok"] is False and "error" not in payload:
+            payload["error"] = "未找到"
+        raw = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -1195,11 +1200,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/health"):
             self._json(200, {"ok": True})
             return
-        self._json(404, {"ok": False})
+        self._json(404, {"ok": False, "error": "未找到"})
 
     def do_POST(self) -> None:
         if not self.path.startswith("/register"):
-            self._json(404, {"ok": False})
+            self._json(404, {"ok": False, "error": "未找到"})
             return
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0 or length > 4096:
