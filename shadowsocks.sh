@@ -914,9 +914,11 @@ write_ip_limit_script() {
 """独享：客户端令牌认设备，ipset 只放行该令牌当前公网 IP。"""
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -929,13 +931,16 @@ TOKEN_FILE = Path("/var/lib/shadowsocks/ip-limit/tokens.json")
 CHAIN = "SS_IP_LIMIT"
 IDLE_RELEASE = 45
 HMAC_WINDOW = 180
+TOKEN_GRACE = 90
 TOKEN_PORT = int(os.environ.get("SS_TOKEN_PORT", "23780"))
+NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 CONF_FILES = (
     "/etc/shadowsocks/config.json",
     "/etc/shadowsocks-libev/config.json",
     "/etc/shadowsocks.json",
 )
 token_lock = threading.Lock()
+nonce_seen: dict[tuple[str, str], float] = {}
 
 
 def log(msg: str) -> None:
@@ -1001,8 +1006,10 @@ def load_tokens() -> dict:
 
 def save_tokens(data: dict) -> None:
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    TOKEN_FILE.chmod(0o600)
+    tmp = TOKEN_FILE.with_name(TOKEN_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    os.replace(tmp, TOKEN_FILE)
 
 
 def endpoint_host(ep: str) -> str:
@@ -1116,10 +1123,18 @@ last_seen: dict[int, float] = {}
 rules_signature = ""
 
 
-def sign(password: str, port: int, token: str, ts: int) -> str:
-    msg = f"{port}|{token}|{ts}".encode()
-    import hashlib
+def sign(password: str, port: int, token: str, ts: int, nonce: str = "") -> str:
+    if nonce:
+        msg = f"{port}|{token}|{ts}|{nonce}".encode()
+    else:
+        msg = f"{port}|{token}|{ts}".encode()
     return hmac.new(password.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def prune_nonces(now: float) -> None:
+    dead = [k for k, exp in nonce_seen.items() if exp <= now]
+    for k in dead:
+        nonce_seen.pop(k, None)
 
 
 def register_token(port: int, token: str, src_ip: str) -> tuple[int, str]:
@@ -1174,10 +1189,12 @@ class Handler(BaseHTTPRequestHandler):
             token = str(body.get("token") or "")
             ts = int(body.get("ts"))
             digest = str(body.get("hmac") or "")
+            nonce = str(body.get("nonce") or "").strip().lower()
         except (TypeError, ValueError):
             self._json(400, {"ok": False, "error": "字段无效"})
             return
-        if abs(int(time.time()) - ts) > HMAC_WINDOW:
+        now = time.time()
+        if abs(int(now) - ts) > HMAC_WINDOW:
             self._json(400, {"ok": False, "error": "时间戳过期"})
             return
         if port not in read_ports():
@@ -1188,10 +1205,24 @@ class Handler(BaseHTTPRequestHandler):
         if not password:
             self._json(500, {"ok": False, "error": "读不到密码"})
             return
-        expect = sign(password, port, token, ts)
+        if nonce:
+            if not NONCE_RE.fullmatch(nonce):
+                self._json(400, {"ok": False, "error": "字段无效"})
+                return
+            with token_lock:
+                prune_nonces(now)
+                if nonce_seen.get((token, nonce), 0) > now:
+                    self._json(403, {"ok": False, "error": "重放被拒"})
+                    return
+            expect = sign(password, port, token, ts, nonce)
+        else:
+            expect = sign(password, port, token, ts)
         if not hmac.compare_digest(expect, digest):
             self._json(403, {"ok": False, "error": "校验失败"})
             return
+        if nonce:
+            with token_lock:
+                nonce_seen[(token, nonce)] = now + HMAC_WINDOW
         src = (self.client_address[0] or "").replace("::ffff:", "")
         code, detail = register_token(port, token, src)
         if code == 200:
@@ -1213,6 +1244,7 @@ def enforce_once() -> None:
         rules_signature = sig
     now = time.time()
     with token_lock:
+        prune_nonces(now)
         data = load_tokens()
     for port in ports:
         rec = data.get(str(port)) if isinstance(data.get(str(port)), dict) else None
@@ -1222,10 +1254,11 @@ def enforce_once() -> None:
         if owner:
             if members != [owner]:
                 bind_ip(port, owner)
-            if owner in online:
+            token_fresh = now - float(rec.get("ts") or 0) < TOKEN_GRACE
+            if owner in online or token_fresh:
                 last_seen[port] = now
             drop_extra_conntrack(port, owner)
-            if owner not in online and now - last_seen.get(port, now) >= IDLE_RELEASE:
+            if owner not in online and not token_fresh and now - last_seen.get(port, now) >= IDLE_RELEASE:
                 ipset_flush(port)
                 last_seen.pop(port, None)
                 with token_lock:
