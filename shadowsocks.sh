@@ -692,7 +692,7 @@ pre_install() {
   echo
 
   echo "0) 服务端程序"
-  echo -e "  ${green}1${plain}) 根据系统自动选择    推荐。兼容的版本，无需区分 Rust 或 libev，单端口用系统里的，多端口自动换成 rust"
+  echo -e "  ${green}1${plain}) 根据系统自动选择    推荐。不区分 Rust 或 libev，单端口用系统里的，多端口自动换成 rust"
   echo -e "  ${green}2${plain}) shadowsocks-rust     官方在维护，单/多端口都推荐，和常见客户端兼容"
   echo -e "  ${green}3${plain}) shadowsocks-libev    上游已停更，单端口够用；多端口经常装不上"
   local i pick start n
