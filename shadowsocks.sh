@@ -1089,9 +1089,12 @@ def ensure_chain(ports: list[int]) -> None:
         port_s = str(port)
         run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
         run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "conntrack", "--ctstate", "NEW", "-j", "SET", "--add-set", name, "src"])
+        run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
+        run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-m", "set", "--match-set", name, "src", "-j", "RETURN"])
         run(["iptables", "-A", CHAIN, "-p", "tcp", "--dport", port_s, "-j", "REJECT", "--reject-with", "tcp-reset"])
         run(["iptables", "-A", CHAIN, "-p", "udp", "--dport", port_s, "-j", "DROP"])
-        log(f"已为端口 {port} 写入防火墙规则（仅放行已登记令牌的 IP）")
+        log(f"已为端口 {port} 写入防火墙（无令牌时先连先占；有令牌则认设备）")
 
 
 def drop_extra_conntrack(port: int, owner: str) -> None:
@@ -1231,9 +1234,22 @@ def enforce_once() -> None:
                         data2[str(port)]["ip"] = ""
                         save_tokens(data2)
                 log(f"端口 {port} 原 IP {owner} 已离线，保留令牌")
-        else:
+        elif rec and rec.get("token"):
             if members:
                 ipset_flush(port)
+        elif members:
+            cur = members[0]
+            if cur in online or online:
+                last_seen[port] = now
+            drop_extra_conntrack(port, cur)
+            if cur not in online and now - last_seen.get(port, now) >= IDLE_RELEASE:
+                ipset_flush(port)
+                last_seen.pop(port, None)
+                log(f"端口 {port} 原 IP {cur} 已离线，释放名额")
+        elif online:
+            first = sorted(online)[0]
+            bind_ip(port, first)
+            log(f"端口 {port} 锁定 {first}（普通客户端）")
 
 
 def serve_tokens() -> None:
@@ -1361,7 +1377,7 @@ EOF
     nohup "$py" "$LIMIT_BIN" >>/var/log/shadowsocks-ip-limit.log 2>&1 &
     echo $! >/var/run/shadowsocks-ip-limit.pid
   fi
-  info "已开启独享（客户端令牌认设备）。请放行 TCP ${TOKEN_PORT}（令牌登记）"
+  info "已开启独享：普通 SS 可先连先占；带令牌客户端换网络可顶替。请放行 TCP ${TOKEN_PORT}"
 }
 
 cmd_limit_on() {
@@ -1375,7 +1391,7 @@ cmd_limit_on() {
     error "读不到端口。若还没部署成功，先运行: ./shadowsocks.sh （选多端口）。若已经在用，把上面打印的配置发回来。"
   fi
   enable_ip_limit
-  echo "已对现有端口启用独享（令牌认设备），没有改密码："
+  echo "已对现有端口启用独享（普通 SS 与令牌客户端都可用），没有改密码："
   printf '  %s\n' "${SS_PORTS[@]}"
   echo "配置: ${CONF_FILE}"
   echo "令牌登记端口: ${TOKEN_PORT}/tcp（云安全组需要放行）"
