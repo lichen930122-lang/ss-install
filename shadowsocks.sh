@@ -39,6 +39,7 @@ LIMIT_BIN="/usr/local/sbin/shadowsocks-ip-limit.py"
 LIMIT_PORTS_FILE="${CONF_DIR}/ip-limit.ports"
 LIMIT_STATE_DIR="/var/lib/shadowsocks/ip-limit"
 LIMIT_UNIT="/etc/systemd/system/shadowsocks-ip-limit.service"
+REGISTER_PORT_FILE="${CONF_DIR}/register.port"
 TOKEN_PORT="${TOKEN_PORT:-23780}"
 
 modes=(tcp_and_udp tcp_only udp_only)
@@ -745,7 +746,7 @@ pre_install() {
     echo "---------------------------"
     echo
 
-    echo "3) 起始端口（会占用连续 ${SS_USER_COUNT} 个端口，密码全部随机）"
+    echo "3) 起始端口（用户占连续 ${SS_USER_COUNT} 个口；若开独享再多用紧挨的 1 个口作报名窗，不发给用户）"
     ask "输入起始端口，回车则随机: " start
     if [[ -z "${start:-}" ]]; then
       for n in 1 2 3 4 5 6 7 8 9 10; do
@@ -829,6 +830,15 @@ pre_install() {
     echo "ip_limit = ${SS_IP_LIMIT}"
     echo "---------------------------"
     echo
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      TOKEN_PORT=$((SS_PORT_END + 1))
+      ((TOKEN_PORT <= 65535)) || error "独享报名口超出 65535，请换更小的起始端口"
+      port_in_use "$TOKEN_PORT" && error "报名口 ${TOKEN_PORT} 已被占用，请换起始端口"
+      echo "---------------------------"
+      echo "登记口 = ${TOKEN_PORT}（不发给用户，安全组要和用户口一段放行）"
+      echo "---------------------------"
+      echo
+    fi
   else
     SS_IP_LIMIT=0
   fi
@@ -840,6 +850,7 @@ pre_install() {
     echo "  方式   多用户 ${SS_USER_COUNT} 人"
     echo "  端口   ${ss_port}-${SS_PORT_END}（一人一端口，密码随机）"
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      echo "  登记口 ${TOKEN_PORT}（不发给用户）"
       echo "  限制   每端口同时只允许 1 个公网 IP"
     else
       echo "  限制   不限制同时在线人数"
@@ -932,8 +943,25 @@ CHAIN = "SS_IP_LIMIT"
 IDLE_RELEASE = 45
 HMAC_WINDOW = 180
 TOKEN_GRACE = 90
-TOKEN_PORT = int(os.environ.get("SS_TOKEN_PORT", "23780"))
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+REGISTER_PORT_FILE = Path("/etc/shadowsocks/register.port")
+
+
+def read_register_port() -> int:
+    if REGISTER_PORT_FILE.exists():
+        try:
+            n = int(REGISTER_PORT_FILE.read_text(encoding="utf-8").strip())
+            if 1 <= n <= 65535:
+                return n
+        except (OSError, ValueError):
+            pass
+    env = os.environ.get("SS_TOKEN_PORT", "").strip()
+    if env.isdigit():
+        return int(env)
+    return 23780
+
+
+TOKEN_PORT = read_register_port()
 CONF_FILES = (
     "/etc/shadowsocks/config.json",
     "/etc/shadowsocks-libev/config.json",
@@ -1365,6 +1393,33 @@ PY
   [[ ${#SS_PORTS[@]} -gt 0 ]]
 }
 
+resolve_register_port() {
+  local cand last
+  if [[ -f "$REGISTER_PORT_FILE" ]]; then
+    cand="$(tr -d '[:space:]' < "$REGISTER_PORT_FILE" 2>/dev/null || true)"
+    if [[ "$cand" =~ ^[0-9]+$ ]] && ((cand >= 1 && cand <= 65535)); then
+      TOKEN_PORT="$cand"
+      return
+    fi
+  fi
+  if [[ -f "$USERS_FILE" ]]; then
+    cand="$(awk '/^登记口/{print $2; exit}' "$USERS_FILE" 2>/dev/null || true)"
+    if [[ "$cand" =~ ^[0-9]+$ ]] && ((cand >= 1 && cand <= 65535)); then
+      TOKEN_PORT="$cand"
+      return
+    fi
+  fi
+  if [[ ${#SS_PORTS[@]} -gt 0 ]]; then
+    last="$(printf '%s\n' "${SS_PORTS[@]}" | sort -n | tail -1)"
+    cand=$((last + 1))
+    if ((cand <= 65535)) && ! port_in_use "$cand"; then
+      TOKEN_PORT="$cand"
+      return
+    fi
+  fi
+  TOKEN_PORT="${TOKEN_PORT:-23780}"
+}
+
 enable_ip_limit() {
   local p py
   command -v iptables >/dev/null 2>&1 || pkg_install iptables || true
@@ -1375,9 +1430,13 @@ enable_ip_limit() {
   command -v ipset >/dev/null 2>&1 || error "ipset 安装失败。请先执行: apt-get install -y ipset"
   py="$(python3_bin)"
   [[ -n "$py" ]] || error "需要 python3"
+  resolve_register_port
   write_ip_limit_script
+  mkdir -p "$CONF_DIR"
+  printf '%s\n' "$TOKEN_PORT" > "$REGISTER_PORT_FILE"
+  chmod 600 "$REGISTER_PORT_FILE"
   open_firewall "$TOKEN_PORT"
-  mkdir -p "$CONF_DIR" "$LIMIT_STATE_DIR"
+  mkdir -p "$LIMIT_STATE_DIR"
   : > "$LIMIT_PORTS_FILE"
   for p in "${SS_PORTS[@]}"; do
     printf '%s\n' "$p" >> "$LIMIT_PORTS_FILE"
@@ -1392,6 +1451,7 @@ After=network.target ${SERVICE_NAME}.service
 [Service]
 Type=simple
 ExecStart=${py} ${LIMIT_BIN}
+Environment=SS_TOKEN_PORT=${TOKEN_PORT}
 Restart=always
 RestartSec=3
 
@@ -1427,7 +1487,8 @@ cmd_limit_on() {
   echo "已对现有端口启用独享（普通 SS 与令牌客户端都可用），没有改密码："
   printf '  %s\n' "${SS_PORTS[@]}"
   echo "配置: ${CONF_FILE}"
-  echo "令牌登记端口: ${TOKEN_PORT}/tcp（云安全组需要放行）"
+  echo "令牌登记端口: ${TOKEN_PORT}/tcp（最后一个用户口 + 1，不发给用户）"
+  echo "云安全组建议一段放行 TCP/UDP ${SS_PORTS[0]:-?}-${TOKEN_PORT}（登记口实际只用 TCP）"
   echo "日志: /var/log/shadowsocks-ip-limit.log"
 }
 
@@ -1459,6 +1520,7 @@ disable_ip_limit() {
   fi
   rm -f "$LIMIT_UNIT" "$LIMIT_PORTS_FILE" "$LIMIT_BIN"
   rm -rf "$LIMIT_STATE_DIR"
+  # 保留 register.port，再次 limit-on 时沿用同一报名口
 }
 
 save_users_file() {
@@ -1467,6 +1529,9 @@ save_users_file() {
     echo "IP        ${ss_ip}"
     echo "加密      ${ss_cipher}"
     echo "模式      ${ss_mode}"
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      echo "登记口    ${TOKEN_PORT}（不发给用户，令牌客户端 POST /register）"
+    fi
     echo
     for i in "${!SS_PORTS[@]}"; do
       uri="$(make_ss_uri "$ss_cipher" "${SS_PWDS[$i]}" "$ss_ip" "${SS_PORTS[$i]}")"
@@ -1509,8 +1574,11 @@ print_result() {
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
       echo "已限制：每个端口同时只允许 1 个公网 IP。后连上的会被踢掉。"
       echo "同一 Wi-Fi/公司 NAT 下多台设备仍算同一个 IP，可以一起用。"
+      echo -e " 登记口    \033[41;37m ${TOKEN_PORT} \033[0m  （不发给用户；写进令牌客户端的 control_port）"
+      echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${TOKEN_PORT}（登记口实际只用 TCP）"
+    else
+      echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}"
     fi
-    echo "请在云厂商安全组放行 TCP/UDP ${ss_port}-${SS_PORT_END}"
   else
     uri="$(make_ss_uri "$ss_cipher" "$ss_pwd" "$ss_ip" "$ss_port")"
     echo -e " 端口      \033[41;37m ${ss_port} \033[0m"
@@ -1553,7 +1621,7 @@ uninstall_shadowsocks() {
   pkill -x ssserver >/dev/null 2>&1 || true
   rm -f "$UNIT_FILE" "$OPENRC_FILE"
   command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
-  rm -f "$CONF_FILE" /etc/shadowsocks-libev/config.json "$USERS_FILE"
+  rm -f "$CONF_FILE" /etc/shadowsocks-libev/config.json "$USERS_FILE" "$REGISTER_PORT_FILE"
   echo "已停止服务并删除配置。系统软件包未卸载。"
 }
 
@@ -1569,7 +1637,11 @@ install_shadowsocks() {
   start_with_fallback
   step "检查本机防火墙"
   if [[ "$SS_PROFILE" == multi ]]; then
-    open_firewall_range "$ss_port" "$SS_PORT_END"
+    if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
+      open_firewall_range "$ss_port" "$TOKEN_PORT"
+    else
+      open_firewall_range "$ss_port" "$SS_PORT_END"
+    fi
     if [[ "$SS_IP_LIMIT" -eq 1 ]]; then
       step "开启每端口单 IP 限制"
       enable_ip_limit
