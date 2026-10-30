@@ -1783,48 +1783,48 @@ cmd_set_pass() {
 }
 
 cmd_show() {
-  local mode="$1"
-  local port_arg="${2:-}"
-  local ports_str target_port method pwd uri airlink="" ss_ip
-  local -a ports=()
+  local ports_str method pwd uri airlink ss_ip target idx p found
+  local -a ports=() want=()
+  shift
   resolve_conf_file
   ports_str="$(ss_conf_py ports)"
   read -r -a ports <<< "$ports_str"
   [[ ${#ports[@]} -gt 0 ]] || error "配置里没有端口"
-  if [[ -z "$port_arg" ]]; then
-    [[ ${#ports[@]} -eq 1 ]] || error "多端口请写明端口，例如: $0 ${mode} ${ports[0]}"
-    target_port="${ports[0]}"
+  if [[ $# -eq 0 || "$1" == all ]]; then
+    want=("${ports[@]}")
   else
-    target_port="$port_arg"
+    want=("$@")
   fi
-  local found=0 p
-  for p in "${ports[@]}"; do
-    [[ "$p" == "$target_port" ]] && found=1 && break
-  done
-  [[ "$found" -eq 1 ]] || error "端口 ${target_port} 不在配置里。现有端口: ${ports_str}"
-  method="$(ss_conf_py method "$target_port")"
-  pwd="$(ss_conf_py password "$target_port")"
-  [[ -n "$method" && -n "$pwd" ]] || error "读不到端口 ${target_port} 的加密或密码"
   if [[ -z "$REGISTER_SPKI" && -f "$REGISTER_SPKI_FILE" ]]; then
     REGISTER_SPKI="$(tr -d ' \r\n' < "$REGISTER_SPKI_FILE")"
   fi
   ss_ip="$(get_ip)"
-  uri="$(make_ss_uri "$method" "$pwd" "$ss_ip" "$target_port")"
-  if [[ -n "$REGISTER_SPKI" ]]; then
-    airlink="$(make_airlink_uri "$method" "$pwd" "$ss_ip" "$target_port")"
-  fi
-  echo
-  echo -e " 端口      \033[41;37m ${target_port} \033[0m"
-  if [[ "$mode" != airlink ]]; then
-    echo -e " 密码      \033[41;37m ${pwd} \033[0m"
-    echo -e " 链接      ${green}${uri}${plain}"
-  fi
-  if [[ -n "$airlink" ]]; then
-    echo -e " Airlink   ${green}${airlink}${plain}"
-  elif [[ "$mode" == airlink ]]; then
-    echo "这台没有 Airlink（还没开独享，或没有登记指纹）。普通链接："
-    echo -e " ${green}${uri}${plain}"
-  fi
+  for target in "${want[@]}"; do
+    found=0
+    idx=0
+    for p in "${ports[@]}"; do
+      if [[ "$p" == "$target" ]]; then
+        found=1
+        break
+      fi
+      idx=$((idx + 1))
+    done
+    [[ "$found" -eq 1 ]] || error "端口 ${target} 不在配置里。现有端口: ${ports_str}"
+    method="$(ss_conf_py method "$target")"
+    pwd="$(ss_conf_py password "$target")"
+    [[ -n "$method" && -n "$pwd" ]] || error "读不到端口 ${target} 的加密或密码"
+    uri="$(make_ss_uri "$method" "$pwd" "$ss_ip" "$target")"
+    airlink=""
+    if [[ -n "$REGISTER_SPKI" ]]; then
+      airlink="$(make_airlink_uri "$method" "$pwd" "$ss_ip" "$target")"
+    fi
+    echo "用户 $((idx + 1))"
+    echo "  端口    ${target}"
+    echo "  密码    ${pwd}"
+    echo "  链接    ${uri}"
+    [[ -n "$airlink" ]] && echo "  Airlink  ${airlink}"
+    echo
+  done
 }
 
 cmd_limit_on() {
@@ -2032,16 +2032,15 @@ case "$action" in
     cmd_set_pass "$@"
     ;;
   airlink|show|link)
-    cmd_show "$action" "${2:-}"
+    shift
+    cmd_show "$action" "$@"
     ;;
   *)
     echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off|set-pass|airlink|show]"
     echo "改密码: $(basename "$0") set-pass [端口] [密码]"
-    echo "  单端口随机新密码:     $(basename "$0") set-pass"
-    echo "  指定口随机新密码:     $(basename "$0") set-pass 23859"
-    echo "  指定口写成指定密码:   $(basename "$0") set-pass 23859 '新密码'"
-    echo "看 Airlink: $(basename "$0") airlink 23859"
-    echo "看端口账号: $(basename "$0") show 23859"
+    echo "看账号: $(basename "$0") show 23865"
+    echo "  多个端口: $(basename "$0") show 23865 23867"
+    echo "  全部端口: $(basename "$0") show"
     exit 1
     ;;
 esac

@@ -121,14 +121,15 @@ chmod +x shadowsocks.sh
 
 ---
 
-## 4b. 看某个端口的 Airlink / 普通链接
+## 4b. 看某个端口的账号（和 users.txt 同一格式）
 
 ```bash
-./shadowsocks.sh airlink 23859
-./shadowsocks.sh show 23859
+./shadowsocks.sh show 23865
+./shadowsocks.sh show 23865 23867
+./shadowsocks.sh show
 ```
 
-单端口可以不写端口号：`./shadowsocks.sh airlink`。`airlink` 主要打印给 Airlink 导入的那行；`show` 会带上密码和普通 `ss://`。
+打印用户、端口、密码、普通链接；开过独享时还有 Airlink。`airlink` 和 `show` 现在是一样的。不写端口就是全部。也可以继续 `grep -A5 '23865' /root/shadowsocks-users.txt` 或 `cat /root/shadowsocks-users.txt`。
 
 ---
 
