@@ -121,7 +121,9 @@ chmod +x shadowsocks.sh
 
 ---
 
-## 4b. 看某个端口的账号（和 users.txt 同一格式）
+## 5. 看账号（和 `/root/shadowsocks-users.txt` 同一格式）
+
+先换成最新脚本（同上 `wget`），再查。打印用户、端口、密码、普通链接；开过独享时还有 Airlink。`show`、`airlink`、`link` 效果相同。
 
 ```bash
 ./shadowsocks.sh show 23865
@@ -129,11 +131,18 @@ chmod +x shadowsocks.sh
 ./shadowsocks.sh show
 ```
 
-打印用户、端口、密码、普通链接；开过独享时还有 Airlink。`airlink` 和 `show` 现在是一样的。不写端口就是全部。也可以继续 `grep -A5 '23865' /root/shadowsocks-users.txt` 或 `cat /root/shadowsocks-users.txt`。
+不写端口（或写 `all`）就是全部。也可以直接看文件：
+
+```bash
+grep -A5 '23865' /root/shadowsocks-users.txt
+cat /root/shadowsocks-users.txt
+```
+
+有 Airlink 时 `grep` 用 `-A5`，`-A4` 会少一行或接到下一个用户。
 
 ---
 
-## 5. 已经装好了，想重装 / 改人数、端口、密码、加密
+## 6. 已经装好了，想重装 / 改人数、端口、密码、加密
 
 和第一次安装同一条命令，会重新走交互，确认 `y` 后覆盖配置，**旧密码作废**：
 
@@ -151,7 +160,7 @@ chmod +x shadowsocks.sh
 
 ---
 
-## 6. 卸载干净
+## 7. 卸载干净
 
 ```bash
 ./shadowsocks.sh uninstall
@@ -174,7 +183,7 @@ chmod +x shadowsocks.sh
 | 新机器、空系统 | `wget` + `chmod` + `./shadowsocks.sh 2>&1 \| tee shadowsocks.log` |
 | 已装好，补独享 | `./shadowsocks.sh limit-on` |
 | 已装好，关独享 | `./shadowsocks.sh limit-off` |
-| 已装好，只改某一口密码 | `./shadowsocks.sh set-pass [端口] [密码]` |
-| 已装好，看某一口 Airlink | `./shadowsocks.sh airlink 23859` |
+| 已装好，只改某一口密码 | `./shadowsocks.sh set-pass` / `set-pass 23859` / `set-pass 23859 '新密码'` |
+| 已装好，看账号 | `./shadowsocks.sh show 23865` ；多个口空格分开；不写端口=全部 |
 | 已装好，整机重配 | 同第一次安装那三行（或已有脚本时只跑 `./shadowsocks.sh`） |
 | 不要了 | `./shadowsocks.sh uninstall` |
