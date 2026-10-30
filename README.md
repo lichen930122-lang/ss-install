@@ -101,7 +101,27 @@ chmod +x shadowsocks.sh
 
 ---
 
-## 4. 已经装好了，想重装 / 改人数、端口、密码、加密
+## 4. 只改某一个端口的密码（不用重装）
+
+先换成最新脚本，再改。单端口、多端口都能用。
+
+```bash
+wget -O shadowsocks.sh https://raw.githubusercontent.com/lichen930122-lang/ss-install/main/shadowsocks.sh
+chmod +x shadowsocks.sh
+```
+
+```bash
+./shadowsocks.sh set-pass
+./shadowsocks.sh set-pass 23859
+./shadowsocks.sh set-pass 23859 '你的新密码'
+./shadowsocks.sh set-pass '你的新密码'
+```
+
+不写密码就是随机生成。会写回配置、重启服务，并更新 `/root/shadowsocks-users.txt`。独享时 Airlink 那行也会一起改。旧链接立刻不能用。
+
+---
+
+## 5. 已经装好了，想重装 / 改人数、端口、密码、加密
 
 和第一次安装同一条命令，会重新走交互，确认 `y` 后覆盖配置，**旧密码作废**：
 
@@ -119,7 +139,7 @@ chmod +x shadowsocks.sh
 
 ---
 
-## 5. 卸载干净
+## 6. 卸载干净
 
 ```bash
 ./shadowsocks.sh uninstall
@@ -142,5 +162,6 @@ chmod +x shadowsocks.sh
 | 新机器、空系统 | `wget` + `chmod` + `./shadowsocks.sh 2>&1 \| tee shadowsocks.log` |
 | 已装好，补独享 | `./shadowsocks.sh limit-on` |
 | 已装好，关独享 | `./shadowsocks.sh limit-off` |
+| 已装好，只改某一口密码 | `./shadowsocks.sh set-pass [端口] [密码]` |
 | 已装好，整机重配 | 同第一次安装那三行（或已有脚本时只跑 `./shadowsocks.sh`） |
 | 不要了 | `./shadowsocks.sh uninstall` |

@@ -6,6 +6,7 @@
 # ./shadowsocks.sh 2>&1 | tee shadowsocks.log
 #
 # 卸载: ./shadowsocks.sh uninstall
+# 改密码: ./shadowsocks.sh set-pass [端口] [密码]
 #
 # 安装时可选：单端口单用户（原版），或多端口多人（一端口一密码）
 
@@ -1544,6 +1545,216 @@ EOF
   info "已开启独享：普通 SS 可先连先占；带令牌客户端换网络可顶替。请放行 TCP ${TOKEN_PORT}（HTTPS）"
 }
 
+ss_conf_py() {
+  command -v python3 >/dev/null 2>&1 || error "改密码需要 python3"
+  [[ -f "$CONF_FILE" ]] || error "还没安装，找不到 ${CONF_FILE}"
+  python3 - "$CONF_FILE" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+cmd = sys.argv[2]
+cfg = json.loads(path.read_text(encoding="utf-8"))
+
+
+def ports_of(cfg):
+    out = []
+    if isinstance(cfg.get("servers"), list):
+        for item in cfg["servers"]:
+            if isinstance(item, dict) and item.get("server_port") is not None:
+                out.append(int(item["server_port"]))
+        return out
+    if isinstance(cfg.get("port_password"), dict):
+        return sorted(int(k) for k in cfg["port_password"])
+    if cfg.get("server_port") is not None:
+        return [int(cfg["server_port"])]
+    return []
+
+
+def method_of(cfg, port):
+    if isinstance(cfg.get("servers"), list):
+        for item in cfg["servers"]:
+            if isinstance(item, dict) and int(item.get("server_port") or -1) == port:
+                return str(item.get("method") or cfg.get("method") or "")
+    return str(cfg.get("method") or "")
+
+
+if cmd == "ports":
+    print(" ".join(str(p) for p in ports_of(cfg)))
+    sys.exit(0)
+
+if cmd == "method":
+    print(method_of(cfg, int(sys.argv[3])))
+    sys.exit(0)
+
+if cmd != "set":
+    sys.exit(1)
+
+port = int(sys.argv[3])
+new = sys.argv[4]
+found = False
+if isinstance(cfg.get("servers"), list):
+    for item in cfg["servers"]:
+        if isinstance(item, dict) and int(item.get("server_port") or -1) == port:
+            item["password"] = new
+            found = True
+            break
+elif isinstance(cfg.get("port_password"), dict):
+    key = None
+    for k in cfg["port_password"]:
+        if int(k) == port:
+            key = k
+            break
+    if key is not None:
+        cfg["port_password"][key] = new
+        found = True
+elif int(cfg.get("server_port") or -1) == port:
+    cfg["password"] = new
+    found = True
+
+if not found:
+    sys.exit(2)
+path.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+print(method_of(cfg, port))
+PY
+}
+
+restart_running_ss() {
+  if has_systemd && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
+    systemctl restart "$SERVICE_NAME" || error "重启 shadowsocks 失败"
+    sleep 0.8
+    systemctl is-active --quiet "$SERVICE_NAME" || error "重启后服务没起来，看 journalctl -u ${SERVICE_NAME}"
+    return
+  fi
+  if command -v rc-service >/dev/null 2>&1 && [[ -f "$OPENRC_FILE" ]]; then
+    rc-service "$SERVICE_NAME" restart || error "重启 shadowsocks 失败"
+    return
+  fi
+  error "找不到已安装的 shadowsocks 服务"
+}
+
+update_users_password_line() {
+  local port="$1" pwd="$2" uri="$3" airlink="${4:-}"
+  [[ -f "$USERS_FILE" ]] || return 0
+  python3 - "$USERS_FILE" "$port" "$pwd" "$uri" "$airlink" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+port = sys.argv[2]
+pwd = sys.argv[3]
+uri = sys.argv[4]
+airlink = sys.argv[5] if len(sys.argv) > 5 else ""
+lines = path.read_text(encoding="utf-8").splitlines()
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    m = re.match(r"^(\s+端口\s+)" + re.escape(port) + r"\s*$", line)
+    if not m:
+        out.append(line)
+        i += 1
+        continue
+    out.append(line)
+    i += 1
+    while i < len(lines):
+        nxt = lines[i]
+        if re.match(r"^\s+密码\s+", nxt):
+            indent = re.match(r"^(\s+密码\s+)", nxt).group(1)
+            out.append(indent + pwd)
+        elif re.match(r"^\s+链接\s+", nxt):
+            indent = re.match(r"^(\s+链接\s+)", nxt).group(1)
+            out.append(indent + uri)
+            if airlink:
+                out.append("  Airlink  " + airlink)
+        elif re.match(r"^\s+Airlink\s+", nxt):
+            i += 1
+            continue
+        else:
+            break
+        i += 1
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+  chmod 600 "$USERS_FILE"
+}
+
+cmd_set_pass() {
+  local ports_str port_arg pass_arg target_port new_pass method uri ss_ip airlink=""
+  local -a ports=()
+  ports_str="$(ss_conf_py ports)"
+  read -r -a ports <<< "$ports_str"
+  [[ ${#ports[@]} -gt 0 ]] || error "配置里没有端口"
+  port_arg="${1:-}"
+  pass_arg="${2:-}"
+
+  if [[ -z "$port_arg" ]]; then
+    [[ ${#ports[@]} -eq 1 ]] || error "多端口请写明要改哪一个，例如: $0 set-pass ${ports[0]}"
+    target_port="${ports[0]}"
+    new_pass="$(random_password)"
+  elif [[ -n "$pass_arg" ]]; then
+    target_port="$port_arg"
+    new_pass="$pass_arg"
+  else
+    local p
+    for p in "${ports[@]}"; do
+      if [[ "$p" == "$port_arg" ]]; then
+        target_port="$p"
+        new_pass="$(random_password)"
+        break
+      fi
+    done
+    if [[ -z "$target_port" ]]; then
+      [[ ${#ports[@]} -eq 1 ]] || error "端口 ${port_arg} 不在配置里。现有端口: ${ports_str}"
+      target_port="${ports[0]}"
+      new_pass="$port_arg"
+    fi
+  fi
+
+  [[ "$target_port" =~ ^[0-9]+$ ]] && ((target_port >= 1 && target_port <= 65535)) || error "端口无效"
+  local found=0 p
+  for p in "${ports[@]}"; do
+    [[ "$p" == "$target_port" ]] && found=1 && break
+  done
+  [[ "$found" -eq 1 ]] || error "端口 ${target_port} 不在配置里。现有端口: ${ports_str}"
+  [[ -n "$new_pass" ]] || error "密码不能为空"
+  [[ ${#new_pass} -le 128 ]] || error "密码太长"
+  [[ "$new_pass" != *$'\n'* ]] || error "密码不能换行"
+
+  method="$(ss_conf_py set "$target_port" "$new_pass")" || error "写入配置失败"
+  [[ -n "$method" ]] || error "配置里没有加密方式"
+  publish_config
+  restart_running_ss
+  if command -v ipset >/dev/null 2>&1; then
+    ipset flush "ssip${target_port}" 2>/dev/null || true
+    ipset flush "ssip${target_port}v6" 2>/dev/null || true
+  fi
+  if command -v conntrack >/dev/null 2>&1; then
+    conntrack -D -p tcp --dport "$target_port" >/dev/null 2>&1 || true
+    conntrack -D -p udp --dport "$target_port" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -z "$REGISTER_SPKI" && -f "$REGISTER_SPKI_FILE" ]]; then
+    REGISTER_SPKI="$(tr -d ' \r\n' < "$REGISTER_SPKI_FILE")"
+  fi
+  ss_ip="$(get_ip)"
+  uri="$(make_ss_uri "$method" "$new_pass" "$ss_ip" "$target_port")"
+  if [[ -n "$REGISTER_SPKI" ]]; then
+    airlink="$(make_airlink_uri "$method" "$new_pass" "$ss_ip" "$target_port")"
+  fi
+  update_users_password_line "$target_port" "$new_pass" "$uri" "$airlink"
+  echo
+  echo "已改端口 ${target_port} 的密码（旧链接立刻失效）"
+  echo -e " 端口      \033[41;37m ${target_port} \033[0m"
+  echo -e " 密码      \033[41;37m ${new_pass} \033[0m"
+  echo -e " 链接      ${green}${uri}${plain}"
+  if [[ -n "$airlink" ]]; then
+    echo -e " Airlink   ${green}${airlink}${plain}"
+  fi
+  [[ -f "$USERS_FILE" ]] && echo "已写入 ${USERS_FILE}"
+}
+
 cmd_limit_on() {
   detect_os
   try_pkg python3 >/dev/null 2>&1 || true
@@ -1744,8 +1955,16 @@ case "$action" in
   uninstall) detect_os; uninstall_shadowsocks ;;
   limit-on) cmd_limit_on ;;
   limit-off) cmd_limit_off ;;
+  set-pass|passwd|set-password)
+    shift
+    cmd_set_pass "$@"
+    ;;
   *)
-    echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off]"
+    echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off|set-pass]"
+    echo "改密码: $(basename "$0") set-pass [端口] [密码]"
+    echo "  单端口随机新密码:     $(basename "$0") set-pass"
+    echo "  指定口随机新密码:     $(basename "$0") set-pass 23859"
+    echo "  指定口写成指定密码:   $(basename "$0") set-pass 23859 '新密码'"
     exit 1
     ;;
 esac
