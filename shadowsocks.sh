@@ -7,6 +7,7 @@
 #
 # 卸载: ./shadowsocks.sh uninstall
 # 改密码: ./shadowsocks.sh set-pass [端口] [密码]
+# 看链接: ./shadowsocks.sh airlink [端口]
 #
 # 安装时可选：单端口单用户（原版），或多端口多人（一端口一密码）
 
@@ -1407,6 +1408,13 @@ find_ss_config() {
   return 1
 }
 
+resolve_conf_file() {
+  local file
+  file="$(find_ss_config || true)"
+  [[ -n "$file" ]] || error "找不到配置文件（试过 /etc/shadowsocks/config.json 和 /etc/shadowsocks-libev/config.json）"
+  CONF_FILE="$file"
+}
+
 parse_ports_from_text() {
   local file="$1"
   grep -oE '"[0-9]{2,5}":' "$file" 2>/dev/null | tr -d '":'
@@ -1580,12 +1588,30 @@ def method_of(cfg, port):
     return str(cfg.get("method") or "")
 
 
+def password_of(cfg, port):
+    if isinstance(cfg.get("servers"), list):
+        for item in cfg["servers"]:
+            if isinstance(item, dict) and int(item.get("server_port") or -1) == port:
+                return str(item.get("password") or "")
+    if isinstance(cfg.get("port_password"), dict):
+        for k, v in cfg["port_password"].items():
+            if int(k) == port:
+                return str(v)
+    if int(cfg.get("server_port") or -1) == port:
+        return str(cfg.get("password") or "")
+    return ""
+
+
 if cmd == "ports":
     print(" ".join(str(p) for p in ports_of(cfg)))
     sys.exit(0)
 
 if cmd == "method":
     print(method_of(cfg, int(sys.argv[3])))
+    sys.exit(0)
+
+if cmd == "password":
+    print(password_of(cfg, int(sys.argv[3])))
     sys.exit(0)
 
 if cmd != "set":
@@ -1683,6 +1709,7 @@ PY
 cmd_set_pass() {
   local ports_str port_arg pass_arg target_port new_pass method uri ss_ip airlink=""
   local -a ports=()
+  resolve_conf_file
   ports_str="$(ss_conf_py ports)"
   read -r -a ports <<< "$ports_str"
   [[ ${#ports[@]} -gt 0 ]] || error "配置里没有端口"
@@ -1753,6 +1780,51 @@ cmd_set_pass() {
     echo -e " Airlink   ${green}${airlink}${plain}"
   fi
   [[ -f "$USERS_FILE" ]] && echo "已写入 ${USERS_FILE}"
+}
+
+cmd_show() {
+  local mode="$1"
+  local port_arg="${2:-}"
+  local ports_str target_port method pwd uri airlink="" ss_ip
+  local -a ports=()
+  resolve_conf_file
+  ports_str="$(ss_conf_py ports)"
+  read -r -a ports <<< "$ports_str"
+  [[ ${#ports[@]} -gt 0 ]] || error "配置里没有端口"
+  if [[ -z "$port_arg" ]]; then
+    [[ ${#ports[@]} -eq 1 ]] || error "多端口请写明端口，例如: $0 ${mode} ${ports[0]}"
+    target_port="${ports[0]}"
+  else
+    target_port="$port_arg"
+  fi
+  local found=0 p
+  for p in "${ports[@]}"; do
+    [[ "$p" == "$target_port" ]] && found=1 && break
+  done
+  [[ "$found" -eq 1 ]] || error "端口 ${target_port} 不在配置里。现有端口: ${ports_str}"
+  method="$(ss_conf_py method "$target_port")"
+  pwd="$(ss_conf_py password "$target_port")"
+  [[ -n "$method" && -n "$pwd" ]] || error "读不到端口 ${target_port} 的加密或密码"
+  if [[ -z "$REGISTER_SPKI" && -f "$REGISTER_SPKI_FILE" ]]; then
+    REGISTER_SPKI="$(tr -d ' \r\n' < "$REGISTER_SPKI_FILE")"
+  fi
+  ss_ip="$(get_ip)"
+  uri="$(make_ss_uri "$method" "$pwd" "$ss_ip" "$target_port")"
+  if [[ -n "$REGISTER_SPKI" ]]; then
+    airlink="$(make_airlink_uri "$method" "$pwd" "$ss_ip" "$target_port")"
+  fi
+  echo
+  echo -e " 端口      \033[41;37m ${target_port} \033[0m"
+  if [[ "$mode" != airlink ]]; then
+    echo -e " 密码      \033[41;37m ${pwd} \033[0m"
+    echo -e " 链接      ${green}${uri}${plain}"
+  fi
+  if [[ -n "$airlink" ]]; then
+    echo -e " Airlink   ${green}${airlink}${plain}"
+  elif [[ "$mode" == airlink ]]; then
+    echo "这台没有 Airlink（还没开独享，或没有登记指纹）。普通链接："
+    echo -e " ${green}${uri}${plain}"
+  fi
 }
 
 cmd_limit_on() {
@@ -1959,12 +2031,17 @@ case "$action" in
     shift
     cmd_set_pass "$@"
     ;;
+  airlink|show|link)
+    cmd_show "$action" "${2:-}"
+    ;;
   *)
-    echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off|set-pass]"
+    echo "用法: $(basename "$0") [install|uninstall|limit-on|limit-off|set-pass|airlink|show]"
     echo "改密码: $(basename "$0") set-pass [端口] [密码]"
     echo "  单端口随机新密码:     $(basename "$0") set-pass"
     echo "  指定口随机新密码:     $(basename "$0") set-pass 23859"
     echo "  指定口写成指定密码:   $(basename "$0") set-pass 23859 '新密码'"
+    echo "看 Airlink: $(basename "$0") airlink 23859"
+    echo "看端口账号: $(basename "$0") show 23859"
     exit 1
     ;;
 esac

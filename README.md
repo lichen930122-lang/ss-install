@@ -121,6 +121,17 @@ chmod +x shadowsocks.sh
 
 ---
 
+## 4b. 看某个端口的 Airlink / 普通链接
+
+```bash
+./shadowsocks.sh airlink 23859
+./shadowsocks.sh show 23859
+```
+
+单端口可以不写端口号：`./shadowsocks.sh airlink`。`airlink` 主要打印给 Airlink 导入的那行；`show` 会带上密码和普通 `ss://`。
+
+---
+
 ## 5. 已经装好了，想重装 / 改人数、端口、密码、加密
 
 和第一次安装同一条命令，会重新走交互，确认 `y` 后覆盖配置，**旧密码作废**：
@@ -163,5 +174,6 @@ chmod +x shadowsocks.sh
 | 已装好，补独享 | `./shadowsocks.sh limit-on` |
 | 已装好，关独享 | `./shadowsocks.sh limit-off` |
 | 已装好，只改某一口密码 | `./shadowsocks.sh set-pass [端口] [密码]` |
+| 已装好，看某一口 Airlink | `./shadowsocks.sh airlink 23859` |
 | 已装好，整机重配 | 同第一次安装那三行（或已有脚本时只跑 `./shadowsocks.sh`） |
 | 不要了 | `./shadowsocks.sh uninstall` |
